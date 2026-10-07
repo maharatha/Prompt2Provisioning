@@ -275,7 +275,7 @@ Deep copies stop accidental aliasing. They are not a lock and not a durability m
 Tests assert behavior: HTTP status, stored status, validation errors, policy rows, `Decimal` totals, hash mismatch, and rendered text. They do not assert private call order.
 
 Required cases include a valid generated plan, malformed JSON, missing fields, unexpected fields, an unsupported region, missing tags, public object storage, excessive quantity, excessive storage, an unknown SKU, totals `71.00` and `73.50`, a warning that does not block, errors that do, a wrong submitted hash, mutation after evaluation, mutation after approval and before render, a rejected plan that cannot render, two identical renders, and the health endpoint. Later slices added:
-- 51 realistic DevOps requests in `tests/planner_cases.json`, each with its expected plan or refusal
+- 80 realistic DevOps requests in `tests/planner_cases.json`, each with its expected plan or refusal
 - an English look-alike guard for typo correction
 - defaults call-outs
 - provider request shapes, with no network

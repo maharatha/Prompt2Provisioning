@@ -29,21 +29,37 @@ Resource phrases, longer phrases first:
 - object storage: ``object storage``, ``blob storage``, ``s3``
 
 Quantity and size are taken from the text after the previous resource phrase
-and before the current phrase. In that window the rightmost quantity wins, the
-rightmost size wins, and the rightmost capacity wins. Quantities are ``one``,
+and before the current phrase, and only from the resource's own clause: the
+text after the last comma, bracket, ``+``, ``&``, or joining word (``and``,
+``plus``, ``or``, ``but``, ``with``, ``for``, ``in``, ``on``, ``at``, ``to``).
+So in ``postgres 15 and a container`` the 15 is not a container count, and in
+``for a large team, two pods`` the pods are not large. In that clause the
+rightmost quantity and the rightmost size win. Quantities are ``one``,
 ``single``, ``two``, ``pair``, ``couple``, ``three`` through ``ten``,
-``dozen``, and a plain integer. The integer is copied as written, including 0
-and values above 100. Sizes are ``small``, ``medium``, ``big``, and ``large``.
+``dozen``, ``half a dozen``, and a plain integer. The integer is copied as
+written, including 0 and values above 100. Versions (``3.12``, ``node 18``),
+ports, percentages, and measurements (``4 vCPU``, ``50 users``, ``3 months``)
+are not counts. ``a few``, ``several``, ``multiple``, ``many``, and ranges
+(``2-3``, ``one or two``) are an interpretation error: the planner does not
+guess a count. Sizes are ``small``, ``medium``, ``big``, and ``large``.
 ``big`` and ``large`` both mean the large SKU. ``N gb`` or ``N gigabytes`` is
-object-storage capacity, and ``N tb`` or ``N terabytes`` is ``N * 1000`` GB.
-Neither is a resource count. Region phrases are blanked before windows are
-read, so the digit in ``us-west-2`` or ``East US 2`` is not a quantity.
+object-storage capacity, ``N tb`` or ``N terabytes`` is ``N * 1000`` GB, and
+``GiB`` and ``TiB`` are converted. Fractions round up to a whole GB. Capacity
+is read from the whole window and is never a resource count. Region phrases
+are blanked before windows are read, so the digit in ``us-west-2`` or
+``East US 2`` is not a quantity.
 
 A window that ends in ``no``, ``not``, ``without``, ``don't need``, or
 ``do not need``, optionally followed by ``any``, ``a``, ``an``, ``extra``,
-``additional``, or ``separate``, negates that resource. It is omitted.
+``additional``, or ``separate``, negates that resource. It is omitted. The
+negation carries across ``or`` / ``nor`` (``no database or bucket``), and a
+resource followed by ``not needed`` or ``not required`` is also omitted.
 
-Regions, leftmost phrase wins. A single space is required:
+Object storage is proposed with ``public_access`` true when its clause says
+``public`` or ``publicly`` (not ``non-public`` or ``not public``), so the
+``storage_public`` policy, not the planner, decides.
+
+Regions. A single space is required:
 
 - ``US East``, ``East US``, ``us-east-1``, ``Northern Virginia`` -> ``us-east-1``
 - ``US West``, ``us-west-2``, ``Oregon`` -> ``us-west-2``
@@ -52,11 +68,16 @@ Regions, leftmost phrase wins. A single space is required:
 A different single-space ``US <direction>`` phrase (north, south, central,
 east, west, and words that start with them) or ``Azure ...`` phrase, such as
 ``US NORTH``, is not a plan. The planner returns an interpretation error
-instead of ``us-east-1`` and instead of a made-up region id. ``us`` followed by
-any other word, as in "give us two", is ordinary text.
+instead of ``us-east-1`` and instead of a made-up region id. So is any other
+AWS-style region or zone id (``eu-west-2``, ``us-east-1a``) and any Azure short
+name (``eastus``, ``westus2``, ``uksouth``). ``us`` followed by any other
+word, as in "give us two", is ordinary text. Two different known regions are
+an interpretation error: the planner plans one region and does not drop one.
 
 Environments, leftmost word wins: ``development`` or ``dev``, ``test``,
-``staging``, or ``qa`` (all ``test``), ``production`` or ``prod``.
+``staging``, or ``qa`` (all ``test``), ``production`` or ``prod``. A word
+after ``not``, ``no``, or ``non-`` (``non-prod``, ``not production``) is not
+the environment.
 
 Defaults
 --------
@@ -72,7 +93,7 @@ Defaults
 - resource order: postgres, then mysql, then container, then object storage
 - tags ``environment`` (the chosen environment), ``owner=dev-team``,
   ``cost-center=engineering``
-- ``public_access`` false
+- ``public_access`` false unless object storage is asked to be public
 
 Owner and cost-center are fixed synthetic defaults. They are not read from the
 prompt, and emitting them is not a policy check.
@@ -83,11 +104,12 @@ planner returns an interpretation error with ``interpretation_field``
 
 Ambiguity
 ---------
-- Two known region phrases: the leftmost phrase is used.
+- Two phrases for the same region: that region. Two different regions: an
+  interpretation error.
 - An unknown region phrase earlier than a known one is an interpretation
   error. The known phrase does not replace it.
 - Two environment words: the leftmost word is used.
-- Two quantities or two sizes in one window: the rightmost value is used.
+- Two quantities or two sizes in one clause: the rightmost value is used.
 - The same resource type mentioned twice: the first non-negated mention
   supplies quantity, size, and capacity. Later mentions of that type are ignored.
 - A size or quantity that appears only after its resource phrase is ignored.
@@ -121,8 +143,10 @@ Names are case-sensitive. An unknown name raises ``UnknownScenarioError``.
 """
 
 import json
+import math
 import re
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
 
@@ -177,7 +201,20 @@ _QUANTITY_WORDS = {
     "ten": 10,
     "dozen": 12,
 }
-_GB_PER_UNIT = {"gb": 1, "gigabytes": 1, "tb": 1000, "terabytes": 1000}
+_GB_PER_UNIT = {
+    "gb": Decimal(1),
+    "gigabytes": Decimal(1),
+    "gib": Decimal("1.073741824"),
+    "tb": Decimal(1000),
+    "terabytes": Decimal(1000),
+    "tib": Decimal("1099.511627776"),
+}
+_TYPE_LABELS = {
+    "postgres": "PostgreSQL",
+    "mysql": "MySQL",
+    "container": "container",
+    "object_storage": "object storage",
+}
 _KNOWN_REGIONS = (
     ("northern virginia", "us-east-1"),
     ("azure east us", "eastus2"),
@@ -229,7 +266,15 @@ _KNOWN_REGION_RE = re.compile(
     re.IGNORECASE,
 )
 _UNKNOWN_REGION_RE = re.compile(
-    r"\b(?:us (?:north|south|central|east|west)[a-z]*|azure [a-z]+(?: [a-z]+)?)\b",
+    r"\b(?:us (?:north|south|central|east|west)[a-z]*|azure [a-z]+(?: [a-z]+)?)\b"
+    # Any AWS-style region or zone id: eu-west-2, ap-northeast-1, us-gov-west-1, us-east-1a.
+    r"|\b[a-z]{2}(?:-gov|-iso[a-z]?)?-(?:north|south|east|west|central)(?:east|west)?-\d+[a-z]?\b"
+    # Azure short names: eastus, westus2, northcentralus, East US2, uksouth, japaneast.
+    r"|\b(?:north|south|east|west|central)(?:central|east|west)?us\d?\b"
+    r"|\b(?:north|south|east|west|central) us\d\b"
+    r"|\b(?:uk|uae|australia|japan|korea|canada|france|germany|norway|switzerland|sweden|"
+    r"brazil|qatar|israel|italy|poland|spain|mexico|southafrica|southeast|east)"
+    r"(?:south|north|east|west|central|asia)\d?\b",
     re.IGNORECASE,
 )
 _KNOWN_REGION_VALUES = {phrase: region for phrase, region in _KNOWN_REGIONS}
@@ -242,7 +287,45 @@ _QUANTITY_RE = re.compile(
     re.IGNORECASE,
 )
 _TIER_RE = re.compile(r"\b(small|medium|big|large)\b", re.IGNORECASE)
-_CAPACITY_RE = re.compile(r"\b(\d+)\s*(gb|gigabytes|tb|terabytes)\b", re.IGNORECASE)
+_CAPACITY_RE = re.compile(
+    r"\b(\d+(?:\.\d+)?)\s*(gb|gigabytes|gib|tb|terabytes|tib)\b", re.IGNORECASE
+)
+# A count or size binds to the next resource only within its own clause, so in
+# "postgres 15 and a container" or "for a large team, two pods" the 15 and the
+# "large" do not reach the next resource.
+_CLAUSE_BREAK_RE = re.compile(
+    r"[,;:()+&]|\b(?:and|plus|or|but|with|for|in|on|at|to|then|also)\b", re.IGNORECASE
+)
+# Numbers that are versions, ports, or measurements, never a resource count.
+_NOT_A_COUNT_RE = re.compile(
+    r"\b\d+(?:\.\d+)+\b|\d+\s*%"
+    r"|\b(?:python|node|nodejs|java|jdk|jre|go|golang|ruby|php|dotnet|net|ubuntu|debian|"
+    r"alpine|centos|rhel|nginx|tomcat|version|ver|port|ports)\s*:?\s*\d+(?:\.\d+)*\b"
+    r"|\b\d+\s*(?:vcpus?|cpus?|cores?|threads?|mb|mib|ram|users?|customers?|rps|qps|tps|"
+    r"requests?|percent|ms|seconds?|minutes?|hours?|days?|weeks?|months?|years?)\b",
+    re.IGNORECASE,
+)
+_HALF_DOZEN_RE = re.compile(r"\bhalf(?:\s+a\s+|-|\s+)dozen\b", re.IGNORECASE)
+_COUNT_TOKEN = r"(?:" + "|".join(_QUANTITY_WORDS) + r"|\d+)"
+_RANGE_RE = re.compile(rf"\b{_COUNT_TOKEN}\s*(?:-|–|to|or)\s*{_COUNT_TOKEN}\b", re.IGNORECASE)
+_VAGUE_QUANTITY_RE = re.compile(
+    r"\b(?:a\s+few|few|several|multiple|many|a\s+bunch\s+of|a\s+handful\s+of|lots\s+of|"
+    r"a\s+lot\s+of)\b",
+    re.IGNORECASE,
+)
+_ENVIRONMENT_NEGATION_RE = re.compile(
+    r"\b(?:not|no|non|never)[\s-]+(?:(?:for|in|a|an|the)\s+)*$", re.IGNORECASE
+)
+_PUBLIC_RE = re.compile(r"(?<!non-)(?<!not )\bpublic(?:ly)?\b", re.IGNORECASE)
+# "no database or bucket": the negation carries across "or" / "nor".
+_NEGATION_CONTINUES_RE = re.compile(r"^\s*,?\s*(?:or|nor)\s+(?:an?\s+|any\s+)?$", re.IGNORECASE)
+# "database not needed": a negation written after the resource.
+_TRAILING_NEGATION_RE = re.compile(
+    r"^\s*(?:is\s+|are\s+)?(?:not\s+(?:needed|required|necessary|wanted)|"
+    r"isn't\s+needed|aren't\s+needed|unnecessary)\b",
+    re.IGNORECASE,
+)
+_AFTER_CLAUSE_RE = re.compile(r"[,;.]|\b(?:and|plus)\b", re.IGNORECASE)
 _NEGATION_RE = re.compile(
     r"\b(?:no|not|without|don't need|do not need)"
     r"(?:\s+(?:any|an?|extra|additional|separate))?\s*$",
@@ -330,6 +413,16 @@ class MockPlanner:
                     )
                 }
             )
+        regions = _named_regions(text)
+        if len(regions) > 1:
+            return _dumps(
+                {
+                    "interpretation_error": (
+                        f"The request names more than one region ({' and '.join(regions)}). "
+                        "This prototype plans one region per request."
+                    )
+                }
+            )
         if normalized.unsupported:
             return _dumps(
                 {
@@ -344,6 +437,9 @@ class MockPlanner:
                     "interpretation_field": "resources",
                 }
             )
+        unclear = _unclear_quantity(text)
+        if unclear is not None:
+            return _dumps({"interpretation_error": unclear, "interpretation_field": "resources"})
         resources = _resources(text)
         if resources is None:
             return _dumps(
@@ -442,8 +538,22 @@ def _read_region(prompt: str) -> tuple[str | None, str | None]:
     return _KNOWN_REGION_VALUES[known.group(0).lower()], None
 
 
+def _named_regions(prompt: str) -> list[str]:
+    """Distinct canonical regions the prompt names, in order of first mention."""
+    found = (_KNOWN_REGION_VALUES[m.group(0).lower()] for m in _KNOWN_REGION_RE.finditer(prompt))
+    return list(dict.fromkeys(found))
+
+
+def _environment_match(prompt: str) -> re.Match[str] | None:
+    """The leftmost environment word not negated, as in "not production" or "non-prod"."""
+    for match in _ENVIRONMENT_RE.finditer(prompt):
+        if not _ENVIRONMENT_NEGATION_RE.search(prompt[: match.start()]):
+            return match
+    return None
+
+
 def _environment(prompt: str) -> str:
-    match = _ENVIRONMENT_RE.search(prompt)
+    match = _environment_match(prompt)
     if match is None:
         return DEFAULT_ENVIRONMENT
     return _ENVIRONMENT_VALUES[match.group(0).lower()]
@@ -460,39 +570,90 @@ def _tags(environment: str) -> dict[str, str]:
 def _resources(prompt: str) -> list[dict[str, object]] | None:
     """Return resources in a fixed order, or ``None`` when none is recognized."""
     found: dict[str, dict[str, object]] = {}
-    for resource_type, window in _mention_windows(prompt).items():
+    for resource_type, mention in _mentions(prompt).items():
+        window = mention.window
         tier = _tier_in(window) or DEFAULT_TIER
-        capacity = _capacity_in(window) if resource_type == "object_storage" else None
+        is_storage = resource_type == "object_storage"
         found[resource_type] = _resource(
             resource_type,
             _quantity_in(window),
             tier,
-            capacity,
+            _capacity_in(window) if is_storage else None,
+            public_access=is_storage and _public_requested(mention),
         )
     if not found:
         return None
     return [found[kind] for kind in _RESOURCE_ORDER if kind in found]
 
 
-def _mention_windows(prompt: str) -> dict[str, str]:
-    """Map each resource type to the text before its first non-negated mention.
+@dataclass(frozen=True)
+class _Mention:
+    window: str
+    after: str
 
-    The window runs from the previous resource phrase to this one; size,
-    quantity, and capacity are read from it.
+
+def _mentions(prompt: str) -> dict[str, _Mention]:
+    """Map each resource type to its first non-negated mention.
+
+    ``window`` runs from the previous resource phrase to this one; size,
+    quantity, and capacity are read from it. ``after`` runs to the next
+    resource phrase and is read only for negation and public access.
     """
     text = _without_regions(prompt)
     matches = list(_RESOURCE_RE.finditer(text))
-    windows: dict[str, str] = {}
+    mentions: dict[str, _Mention] = {}
+    previous_negated = False
     for index, match in enumerate(matches):
         resource_type = _resource_type(match.group(0))
-        if resource_type in windows:
-            continue
         window_start = matches[index - 1].end() if index else 0
         window = text[window_start : match.start()]
-        if _NEGATION_RE.search(window):
+        after_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        after = text[match.end() : after_end]
+        negated = (
+            _NEGATION_RE.search(window) is not None
+            or (previous_negated and _NEGATION_CONTINUES_RE.search(window) is not None)
+            or _TRAILING_NEGATION_RE.search(after) is not None
+        )
+        previous_negated = negated
+        if negated or resource_type in mentions:
             continue
-        windows[resource_type] = window
-    return windows
+        mentions[resource_type] = _Mention(window, after)
+    return mentions
+
+
+def _mention_windows(prompt: str) -> dict[str, str]:
+    return {kind: mention.window for kind, mention in _mentions(prompt).items()}
+
+
+def _binding(window: str) -> str:
+    """The part of a window in the resource's own clause."""
+    breaks = list(_CLAUSE_BREAK_RE.finditer(window))
+    return window[breaks[-1].end() :] if breaks else window
+
+
+def _public_requested(mention: _Mention) -> bool:
+    after = _AFTER_CLAUSE_RE.split(mention.after, maxsplit=1)[0]
+    return bool(_PUBLIC_RE.search(_binding(mention.window)) or _PUBLIC_RE.search(after))
+
+
+def _unclear_quantity(prompt: str) -> str | None:
+    """Explain a count the planner will not guess: "several pods", "2-3 containers"."""
+    for kind, window in _mention_windows(prompt).items():
+        label = _TYPE_LABELS[kind]
+        vague = _VAGUE_QUANTITY_RE.search(_binding(window))
+        if vague is not None:
+            return (
+                f"'{vague.group(0)}' does not say how many {label} resources. "
+                "State a number, such as 'three'."
+            )
+        counted = _NOT_A_COUNT_RE.sub(" ", _CAPACITY_RE.sub(" ", window))
+        for found in _RANGE_RE.finditer(counted):
+            if not _CLAUSE_BREAK_RE.search(counted[found.end() :]):
+                return (
+                    f"'{found.group(0)}' is a range, not a count of {label} resources. "
+                    "State one number."
+                )
+    return None
 
 
 @dataclass(frozen=True)
@@ -521,7 +682,7 @@ def stated_details(prompt: str) -> StatedDetails | None:
     low_cost = _LOW_COST_RE.search(text) is not None
     return StatedDetails(
         region=_KNOWN_REGION_RE.search(text) is not None,
-        environment=_ENVIRONMENT_RE.search(text) is not None,
+        environment=_environment_match(text) is not None,
         owner=_OWNER_RE.search(text) is not None,
         cost_center=_COST_CENTER_RE.search(text) is not None,
         mentioned=frozenset(windows),
@@ -565,7 +726,8 @@ def _resource_type(phrase: str) -> str:
 
 
 def _quantity_in(window: str) -> int:
-    stripped = _CAPACITY_RE.sub(" ", window)
+    stripped = _NOT_A_COUNT_RE.sub(" ", _CAPACITY_RE.sub(" ", window))
+    stripped = _HALF_DOZEN_RE.sub(" 6 ", _binding(stripped))
     matches = list(_QUANTITY_RE.finditer(stripped))
     if not matches:
         return DEFAULT_QUANTITY
@@ -576,18 +738,19 @@ def _quantity_in(window: str) -> int:
 
 
 def _tier_in(window: str) -> str | None:
-    matches = list(_TIER_RE.finditer(window))
+    matches = list(_TIER_RE.finditer(_binding(window)))
     if not matches:
         return None
     return _TIER_VALUES[matches[-1].group(1).lower()]
 
 
 def _capacity_in(window: str) -> int | None:
+    """Capacity in whole GB. Binary units (GiB, TiB) and fractions round up."""
     matches = list(_CAPACITY_RE.finditer(window))
     if not matches:
         return None
     amount, unit = matches[-1].groups()
-    return int(amount) * _GB_PER_UNIT[unit.lower()]
+    return math.ceil(Decimal(amount) * _GB_PER_UNIT[unit.lower()])
 
 
 def _resource(
@@ -595,6 +758,8 @@ def _resource(
     quantity: int,
     tier: str,
     capacity_gb: int | None,
+    *,
+    public_access: bool = False,
 ) -> dict[str, object]:
     if resource_type == "object_storage":
         sku = _STORAGE_SKU
@@ -608,7 +773,7 @@ def _resource(
     }
     if resource_type == "object_storage":
         body["capacity_gb"] = DEFAULT_CAPACITY_GB if capacity_gb is None else capacity_gb
-    body["public_access"] = False
+    body["public_access"] = public_access
     return body
 
 

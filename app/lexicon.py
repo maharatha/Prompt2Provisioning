@@ -9,6 +9,7 @@ planner parses it, and records every rewrite so the reviewer can see it:
    Longer aliases win.
 3. Quantity phrasing is moved in front of the resource: ``api x3``, ``3x api``,
    ``3 replicas of the api``, and ``api with 3 instances`` become ``3 api``.
+   A size in brackets after a resource, ``pg (large)``, becomes ``large pg``.
 4. Remaining unknown words are compared with a short list of distinctive
    planner words using Damerau-Levenshtein distance (a swapped letter pair is
    one edit). A word of six or more letters exactly one edit from a single
@@ -187,6 +188,7 @@ def normalize(
         readings,
     )
     text = _move_quantities(text, resource_pattern, readings)
+    text = _move_sizes(text, resource_pattern, readings)
     return Normalized(
         text=text,
         readings=tuple(dict.fromkeys(readings)),
@@ -252,6 +254,22 @@ def _move_quantities(text: str, resource_pattern: str, readings: list[str]) -> s
     return re.sub(
         rf"\b((\d+)\s+{_QUANTITY_UNITS})\s+of\s+(?:the\s+|our\s+|an?\s+)?",
         lambda m: record(m.group(1), m.group(2), f"{m.group(2)} "),
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
+def _move_sizes(text: str, resource_pattern: str, readings: list[str]) -> str:
+    """``pg (large)`` -> ``large pg``, so a size in brackets is not lost."""
+
+    def move(match: re.Match[str]) -> str:
+        size = match.group(2).lower()
+        readings.append(f"Read '({match.group(2)})' as size {size} for the resource before it.")
+        return f"{size} {match.group(1)}"
+
+    return re.sub(
+        rf"({resource_pattern})\s*\(\s*(small|medium|large|big)\s*\)",
+        move,
         text,
         flags=re.IGNORECASE,
     )

@@ -565,14 +565,14 @@ Both planners are untrusted proposal generators. The checks after them are the s
 
 1. **Normalize** ([app/lexicon.py](app/lexicon.py), vocabulary in [app/data/lexicon.json](app/data/lexicon.json)). This pass rewrites DevOps wording into the planner's own words:
    - **Synonyms.** `rds`, `aurora postgres`, `cloud sql`, `pg` → PostgreSQL. `mariadb`, `rds mysql` → MySQL. `pods`, `api`, `microservices`, `fargate`, `backend`, `web app`, `workers` → container. `bucket`, `gcs`, `minio` → object storage. `uat`, `preprod`, `stg` → test. `prd` → prod. `sandbox` → dev. `iad`, `virginia`, `east coast` → us-east-1. `pdx`, `west coast`, `us-west` → us-west-2. `tiny`, `xs` → small. `midsize` → medium. `beefy`, `huge` → large.
-   - **Quantity phrasing.** `api x3`, `3x api`, `3 replicas of the api`, and `api with 3 instances` all mean 3 containers.
+   - **Quantity phrasing.** `api x3`, `3x api`, `3 replicas of the api`, and `api with 3 instances` all mean 3 containers. A size in brackets after a resource, `pg (large)`, is moved in front of it.
    - **Typos.** A word of six or more letters that is exactly **one edit** (Damerau-Levenshtein: one wrong, missing, extra, or swapped letter) from a distinctive planner word is corrected: `dataabse` → database, `postgress`, `contaner`, `prodution`, `virgina`. A word of six or more letters **two edits** from a resource noun is refused with a suggestion (`dataabes`, `datbse`). Anything else is ignored.
-   - **Unsupported things are refused, not dropped.** `redis`, `kafka`, `ec2`, `vm`, `lambda`, `load balancer`, `dynamodb`, and others return *"This prototype cannot provision the resource 'redis'"*. Regions outside the allow-list, such as `Frankfurt`, `Europe`, `us-east-2`, and `ohio`, return *"Unrecognized region"* instead of quietly becoming us-east-1.
+   - **Unsupported things are refused, not dropped.** `redis`, `kafka`, `ec2`, `vm`, `lambda`, `load balancer`, `dynamodb`, and others return *"This prototype cannot provision the resource 'redis'"*. Regions outside the allow-list, such as `Frankfurt`, `Europe`, `us-east-2`, `ohio`, any other AWS region or zone id (`eu-west-2`, `us-east-1a`), and Azure short names (`eastus`, `westus2`, `uksouth`), return *"Unrecognized region"* instead of quietly becoming us-east-1.
 2. **Parse** the normalized text with the fixed vocabulary below.
 
 **Every rewrite is shown.** For a built-in plan, `interpretation_notes` lists each one: *"Read 'rds' as PostgreSQL (DevOps term)."*, *"Read 'dataabse' as 'database' (likely typo, one letter off)."*, *"Read 'api x3' as quantity 3."* The Work page shows them under **How the request was read**. The rule is: **correct only when the meaning is unambiguous, always show the correction, and refuse otherwise.**
 
-Edit distance cannot tell a typo from a real word: *staying* is one edit from *staging*, and *backed* is one edit from *backend*. So the typo targets are a short list chosen to have no common English word nearby. A scan of 25,000 distinct words found no harmful corrections. The look-alikes it found are pinned in [tests/test_lexicon.py](tests/test_lexicon.py), and `not_typos` in the lexicon lists the exceptions. [tests/planner_cases.json](tests/planner_cases.json) holds 51 realistic DevOps requests with the plan or refusal each must produce. Add a case there whenever the lexicon changes.
+Edit distance cannot tell a typo from a real word: *staying* is one edit from *staging*, and *backed* is one edit from *backend*. So the typo targets are a short list chosen to have no common English word nearby. A scan of 25,000 distinct words found no harmful corrections. The look-alikes it found are pinned in [tests/test_lexicon.py](tests/test_lexicon.py), and `not_typos` in the lexicon lists the exceptions. [tests/planner_cases.json](tests/planner_cases.json) holds 80 realistic DevOps requests with the plan or refusal each must produce. Add a case there whenever the lexicon changes.
 
 | Phrase (after normalization) | Result |
 |---|---|
@@ -587,14 +587,18 @@ Edit distance cannot tell a typo from a real word: *staying* is one edit from *s
 | US West, Oregon, `us-west-2` | `us-west-2` |
 | Azure East US, East US 2, `eastus2` | `eastus2` |
 | small, medium, big, large | matching SKU tier |
-| one … ten, single, pair, couple, dozen, or a number | quantity |
-| `N GB`, `N gigabytes`, `N TB`, `N terabytes` | storage `capacity_gb` (1 TB = 1000 GB) |
-| no, not, without, don't need *before* a resource | that resource is left out |
+| one … ten, single, pair, couple, dozen, half a dozen, or a number | quantity |
+| `N GB`, `N gigabytes`, `N TB`, `N terabytes`, `N GiB`, `N TiB` | storage `capacity_gb` (1 TB = 1000 GB; binary units and fractions round up) |
+| no, not, without, don't need *before* a resource; *no X or Y*; *X not needed* | that resource is left out |
+| public, publicly *on object storage* | `public_access: true`, which the `storage_public` policy blocks |
 
 How a sentence is read:
 
-- Size, quantity, and capacity bind to the next resource phrase. They are read from the text between the previous resource phrase and this one.
-- Region phrases are blanked before quantities are read, so the `2` in `us-west-2` is not a count.
+- Size, quantity, and capacity bind to the next resource phrase. They are read from the text between the previous resource phrase and this one. Size and quantity come only from the resource's own clause (after the last comma, bracket, `+`, or joining word such as *and*, *for*, *with*), so in *"postgres 15 and a container"* the 15 is not a container count.
+- Versions (`python 3.12`, `node 18`), ports, percentages, and measurements (`4 vCPU`, `50 users`, `3 months`) are not counts.
+- *A few*, *several*, *multiple*, *many*, and ranges (*2-3*, *one or two*) are an interpretation error. The planner does not guess a count.
+- Region phrases are blanked before quantities are read, so the `2` in `us-west-2` is not a count. Two different regions in one request (*us-east-1 and us-west-2 for DR*) are an interpretation error, not a silent pick.
+- An environment word after *not*, *no*, or *non-* (*non-prod*, *not production*) is ignored, so the plan uses the dev default and says so.
 - `big` and `large` both mean the large SKU. `low cost` keeps the small default and does not replace an explicit size.
 - A prompt with no region phrase uses `us-east-1`. `US North`, `US Central`, or an unknown `Azure …` phrase is an interpretation error, not a guess. "Give **us** two containers" is ordinary text.
 - A prompt with no recognized resource, or one that negates every resource it names, is an interpretation error on `resources`. It is not turned into a default container.
@@ -739,7 +743,7 @@ Prompt injection ("ignore your instructions and…") can only change the JSON. T
 ├── docs/button-flow.html
 └── tests/
     ├── test_planner.py              # vocabulary, typos, scenarios, stated details
-    ├── planner_cases.json           # 51 DevOps requests and the plan or refusal each must produce
+    ├── planner_cases.json           # 80 DevOps requests and the plan or refusal each must produce
     ├── test_lexicon.py              # edit distance, alias boundaries, English look-alikes
     ├── test_models.py
     ├── test_validation.py
@@ -774,7 +778,7 @@ What pytest cannot cover:
 - **Real OpenAI and Anthropic responses** were not exercised without keys. The request shapes are pinned by `test_llm.py`.
 - **A real "Sign in with ChatGPT" round trip** needs a Plus or Pro account and a browser. The authorize URL, token exchange, refresh, and streamed Responses events are pinned by `test_chatgpt_auth.py` and `test_llm.py`. They follow OpenAI's published flow, but no real account has exercised them yet.
 
-Coverage includes a valid generated plan, malformed JSON, missing fields, unexpected fields, an unsupported region, missing tags, public object storage, excessive quantity, excessive storage, an unknown SKU, the decimal totals, a warning that does not block approval, errors that do, a wrong submitted hash, a proposal changed after evaluation, a proposal changed after approval and before render, a rejected plan that cannot render, two identical renders, planner wording (unrecognized resources, negation, region digits, the word "us", number words, synonyms, TB), 51 realistic DevOps requests in `planner_cases.json`, typo correction and its English look-alike guard, unsupported resources and regions, defaults call-outs for every planner, catalog and decision routes, the optional provider boundary (key redaction, OpenAI JSON mode and reasoning effort, a Claude output schema that uses only closed objects and low effort except on Haiku, refused, cut-off, and oversized replies, the prompt length limits, interpretation notes, and call-duration logs), the UI verdict banners, examples, formatted JSON, and prompt check, and the health endpoint.
+Coverage includes a valid generated plan, malformed JSON, missing fields, unexpected fields, an unsupported region, missing tags, public object storage, excessive quantity, excessive storage, an unknown SKU, the decimal totals, a warning that does not block approval, errors that do, a wrong submitted hash, a proposal changed after evaluation, a proposal changed after approval and before render, a rejected plan that cannot render, two identical renders, planner wording (unrecognized resources, negation, region digits, the word "us", number words, synonyms, TB), 80 realistic DevOps requests in `planner_cases.json`, typo correction and its English look-alike guard, unsupported resources and regions, defaults call-outs for every planner, catalog and decision routes, the optional provider boundary (key redaction, OpenAI JSON mode and reasoning effort, a Claude output schema that uses only closed objects and low effort except on Haiku, refused, cut-off, and oversized replies, the prompt length limits, interpretation notes, and call-duration logs), the UI verdict banners, examples, formatted JSON, and prompt check, and the health endpoint.
 
 ## Design boundaries
 
@@ -808,7 +812,7 @@ Representative prompts from that pass, lightly edited:
 - *"How do we ensure the AI models don't deviate from what they are supposed to do? Should we put some guardrails in place?"* This led to prompt and reply size limits, refusal and cut-off handling, and comparing a model plan with the built-in reading.
 - *"When there is a validation error it is almost unrecognizable. Build something which makes it very obvious."* This led to the verdict banners and the red stepper.
 - *"I wrote 'a dataabse and container' and it only provisioned the container. Why?"* This led to typo handling. A first similarity-ratio approach was rejected after a 25,000-word scan showed it corrected real words such as *staying* to *staging*. It was replaced by one-edit Damerau-Levenshtein correction toward a short list of distinctive words.
-- *"Can we make the built-in planner work on similar and misspelled words, more geared towards DevOps?"* This led to the DevOps lexicon and the 51-case request file.
+- *"Can we make the built-in planner work on similar and misspelled words, more geared towards DevOps?"* This led to the DevOps lexicon and the request case file (now 80 cases).
 - *"If someone doesn't specify region or environment, explicitly show that we used the defaults."* This led to `defaults_applied`.
 - *"Have you done something with the UI which is adding false delay?"* Measuring showed the UI and API add under 0.25 s. The real cause was a larger model token budget, so the fix was low reasoning effort plus per-call timing logs.
 

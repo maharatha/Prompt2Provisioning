@@ -387,21 +387,43 @@ def test_low_cost_uses_small_skus_without_replacing_medium(planner: MockPlanner)
     ]
 
 
-def test_leftmost_region_and_environment_win(planner: MockPlanner) -> None:
+def test_two_different_regions_are_refused_not_narrowed(planner: MockPlanner) -> None:
     regions = _load(planner.generate("one database in US West or US East"))
-    assert regions["region"] == "us-west-2"
+    assert "resources" not in regions
+    assert "more than one region (us-west-2 and us-east-1)" in regions["interpretation_error"]
 
+    same = _load(planner.generate("one database in US East (us-east-1)"))
+    assert same["region"] == "us-east-1"
+
+
+def test_leftmost_environment_wins(planner: MockPlanner) -> None:
     environments = _load(planner.generate("one database for prod and dev"))
     assert environments["environment"] == "prod"
     assert environments["tags"]["environment"] == "prod"
 
 
-def test_rightmost_quantity_and_size_in_the_window_win(planner: MockPlanner) -> None:
+def test_negated_environment_word_is_not_the_environment(planner: MockPlanner) -> None:
+    for prompt in ("two pods in non-prod", "this is not production: two containers"):
+        payload = _load(planner.generate(prompt))
+        assert payload["environment"] == "dev", prompt
+        details = stated_details(prompt)
+        assert details is not None and details.environment is False, prompt
+
+
+def test_count_range_is_refused_and_rightmost_size_wins(planner: MockPlanner) -> None:
     quantity = _load(planner.generate("one or two web containers"))
-    assert _resources(quantity)[0]["quantity"] == 2
+    assert "resources" not in quantity
+    assert "'one or two' is a range" in quantity["interpretation_error"]
 
     size = _load(planner.generate("small or medium web containers"))
     assert _resources(size)[0]["sku"] == "container-medium"
+
+
+def test_size_outside_the_resource_clause_is_not_applied(planner: MockPlanner) -> None:
+    payload = _load(planner.generate("for a large team, two containers"))
+    assert _resources(payload)[0]["sku"] == "container-small"
+    details = stated_details("for a large team, two containers")
+    assert details is not None and "container" not in details.sized
 
 
 def test_first_mention_of_a_resource_type_wins(planner: MockPlanner) -> None:
@@ -587,10 +609,23 @@ def test_terabytes_set_storage_capacity_in_gb(planner: MockPlanner) -> None:
     assert spelled["quantity"] == 2
 
 
-def test_public_word_does_not_mark_storage_public(planner: MockPlanner) -> None:
-    payload = _load(planner.generate("public object storage in US East"))
-    resource = _resources(payload)[0]
-    assert resource["type"] == "object_storage"
+def test_public_storage_request_is_proposed_public_for_policy_to_block(planner: MockPlanner) -> None:
+    # The planner must not quietly make a request compliant; storage_public decides.
+    for prompt in (
+        "public object storage in US East",
+        "a publicly readable s3 bucket",
+        "a bucket with public read access and a postgres",
+    ):
+        storage = [r for r in _resources(_load(planner.generate(prompt))) if r["type"] == "object_storage"]
+        assert storage[0]["public_access"] is True, prompt
+
+    for prompt in ("a private bucket", "a non-public bucket", "a bucket that is not public"):
+        resource = _resources(_load(planner.generate(prompt)))[0]
+        assert resource["public_access"] is False, prompt
+
+
+def test_public_container_is_not_marked_public(planner: MockPlanner) -> None:
+    resource = _resources(_load(planner.generate("a public api container")))[0]
     assert resource["public_access"] is False
 
 
