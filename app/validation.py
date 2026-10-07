@@ -34,11 +34,23 @@ def validate_raw_plan(raw: str) -> ValidationResult:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         return _failure(_json_issue(exc))
+    interpretation = _interpretation_issue(payload)
+    if interpretation is not None:
+        return _failure(interpretation)
     try:
         proposed = ProposedPlan.model_validate(payload)
     except ValidationError as exc:
         return _failure(*(_schema_issue(error) for error in exc.errors()))
     return ValidationResult(proposed=proposed, errors=())
+
+
+def _interpretation_issue(payload: object) -> ValidationIssue | None:
+    if not isinstance(payload, dict):
+        return None
+    message = payload.get("interpretation_error")
+    if not isinstance(message, str) or message.strip() == "":
+        return None
+    return ValidationIssue(code="unrecognized_input", message=message, field_path="region")
 
 
 def _failure(*issues: ValidationIssue) -> ValidationResult:

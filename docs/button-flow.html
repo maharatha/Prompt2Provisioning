@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>What each button does</title>
+  <style>
+    :root {
+      --paper: #f4f1ea;
+      --ink: #1c1915;
+      --muted: #5e584e;
+      --line: #d8d2c6;
+      --card: #fbfaf7;
+      --accent: #0e4d7a;
+      --accent-wash: #e5f0f7;
+      --untrusted: #8a4b08;
+      --untrusted-wash: #f8efe3;
+      --ok: #1d6b45;
+      --ok-wash: #e7f3ec;
+      --off: #8d877c;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: "Segoe UI", Helvetica, sans-serif;
+      font-size: 15px;
+      line-height: 1.45;
+    }
+
+    body {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 28px 32px 48px;
+    }
+
+    header h1 {
+      margin: 0 0 6px;
+      font-family: Georgia, "Palatino Linotype", serif;
+      font-size: 24px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+
+    header p {
+      margin: 0;
+      max-width: 68ch;
+      color: var(--muted);
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 22px 0 12px;
+    }
+
+    button {
+      font: inherit;
+      color: var(--ink);
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+
+    button:hover { border-color: #b7b0a3; }
+
+    button[aria-pressed="true"] {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #f7fbfe;
+    }
+
+    button:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .transport {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(280px, 0.7fr);
+      gap: 22px;
+      align-items: start;
+    }
+
+    .stage {
+      position: relative;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-areas:
+        "ui route service planner"
+        "validate policies pricing hash"
+        "store store artifact artifact";
+      gap: 14px 12px;
+      padding: 8px 4px 4px;
+    }
+
+    .node {
+      position: relative;
+      grid-area: var(--area);
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      min-height: 86px;
+      padding: 12px 28px 10px 12px;
+    }
+
+    .node.off { opacity: 0.32; }
+
+    .node.current {
+      border-color: var(--accent);
+      background: var(--accent-wash);
+    }
+
+    .node.untrusted { border-color: #e2c7a4; }
+
+    .node.untrusted.current {
+      border-color: var(--untrusted);
+      background: var(--untrusted-wash);
+    }
+
+    .node .order {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 4px;
+      border-radius: 9px;
+      background: var(--accent);
+      color: #f7fbfe;
+      font-size: 11px;
+      line-height: 18px;
+      text-align: center;
+      opacity: 0;
+    }
+
+    .node.visited .order { opacity: 1; }
+
+    .node h2 {
+      margin: 0 0 2px;
+      font-size: 14px;
+      font-weight: 650;
+    }
+
+    .node p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .node .role {
+      display: inline-block;
+      margin-bottom: 6px;
+      color: var(--untrusted);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    #token {
+      position: absolute;
+      z-index: 2;
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      border: 2px solid var(--paper);
+      border-radius: 50%;
+      background: var(--accent);
+      outline: 2px solid var(--accent);
+      pointer-events: none;
+      transform: translate(-20px, -20px);
+      transition: transform 0.55s linear;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px 18px;
+      margin-top: 14px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .swatch {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      margin-right: 6px;
+      border: 1px solid var(--line);
+      vertical-align: -1px;
+    }
+
+    .swatch.now { background: var(--accent-wash); border-color: var(--accent); }
+    .swatch.trust { background: var(--untrusted-wash); border-color: var(--untrusted); }
+    .swatch.skip { background: #e4e0d6; border-color: #c4beb2; }
+
+    aside {
+      position: sticky;
+      top: 16px;
+    }
+
+    .kicker {
+      margin: 0 0 8px;
+      color: var(--accent);
+      font-size: 12px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    aside h2 {
+      margin: 0 0 8px;
+      font-family: Georgia, "Palatino Linotype", serif;
+      font-size: 22px;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+    }
+
+    aside .body {
+      margin: 0 0 16px;
+      min-height: 4.4em;
+    }
+
+    dl {
+      margin: 0;
+      display: grid;
+      grid-template-columns: 92px 1fr;
+      gap: 8px 10px;
+      font-size: 13px;
+    }
+
+    dt { color: var(--muted); }
+
+    dd { margin: 0; }
+
+    .status {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 3px;
+      background: var(--ok-wash);
+      color: var(--ok);
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+    }
+
+    .status.terminal {
+      background: #f6e8e4;
+      color: #8a3324;
+    }
+
+    .states {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      margin-top: 22px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+      color: var(--off);
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+    }
+
+    .states strong {
+      color: var(--ink);
+      font-weight: 650;
+    }
+
+    .counter { color: var(--ink); }
+
+    @media (max-width: 860px) {
+      body { padding: 18px 16px 32px; }
+      .layout { grid-template-columns: 1fr; }
+      aside { position: static; }
+      .stage {
+        grid-template-columns: 1fr 1fr;
+        grid-template-areas:
+          "ui route"
+          "service planner"
+          "validate policies"
+          "pricing hash"
+          "store artifact";
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      #token { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>What each button does</h1>
+    <p>
+      This is the Streamlit screen, drawn as the path a click actually takes.
+      The planner is the only untrusted step. Everything after that JSON string
+      is ordinary Python. Nothing on this page calls the API or deploys infrastructure.
+    </p>
+  </header>
+
+  <div class="controls" role="toolbar" aria-label="UI buttons">
+    <button type="button" data-flow="generate" aria-pressed="true">1 Generate plan</button>
+    <button type="button" data-flow="approve">2 Approve</button>
+    <button type="button" data-flow="reject">3 Reject</button>
+    <button type="button" data-flow="artifact">4 Generate artifact</button>
+    <button type="button" data-flow="refresh">5 Refresh</button>
+    <button type="button" data-flow="download">6 Download main.tf</button>
+  </div>
+
+  <div class="transport">
+    <button type="button" id="pause">Pause</button>
+    <button type="button" id="next">Next</button>
+    <button type="button" id="replay">Replay</button>
+    <span id="counter" class="counter">Step 1 of 9</span>
+    <span>Keys 1–6 switch buttons. Space pauses.</span>
+  </div>
+
+  <div class="layout">
+    <div>
+      <div class="stage" id="stage">
+        <div id="token" aria-hidden="true"></div>
+        <article class="node" data-node="ui" style="--area: ui">
+          <span class="order"></span>
+          <h2>Streamlit</h2>
+          <p data-sub>ui/app.py · HTTP only</p>
+        </article>
+        <article class="node" data-node="route" style="--area: route">
+          <span class="order"></span>
+          <h2>FastAPI route</h2>
+          <p data-sub>app/main.py</p>
+        </article>
+        <article class="node" data-node="service" style="--area: service">
+          <span class="order"></span>
+          <h2>PlanService</h2>
+          <p data-sub>owns the transition</p>
+        </article>
+        <article class="node untrusted" data-node="planner" style="--area: planner">
+          <span class="order"></span>
+          <span class="role">Untrusted</span>
+          <h2>Mock planner</h2>
+          <p data-sub>returns a JSON string</p>
+        </article>
+        <article class="node" data-node="validate" style="--area: validate">
+          <span class="order"></span>
+          <h2>Validation</h2>
+          <p data-sub>parse and schema</p>
+        </article>
+        <article class="node" data-node="policies" style="--area: policies">
+          <span class="order"></span>
+          <h2>Policies</h2>
+          <p data-sub>report only</p>
+        </article>
+        <article class="node" data-node="pricing" style="--area: pricing">
+          <span class="order"></span>
+          <h2>Pricing</h2>
+          <p data-sub>synthetic Decimal</p>
+        </article>
+        <article class="node" data-node="hash" style="--area: hash">
+          <span class="order"></span>
+          <h2>Canonical hash</h2>
+          <p data-sub>SHA-256, written once</p>
+        </article>
+        <article class="node" data-node="store" style="--area: store">
+          <span class="order"></span>
+          <h2>In-memory store</h2>
+          <p data-sub>one process dict</p>
+        </article>
+        <article class="node" data-node="artifact" style="--area: artifact">
+          <span class="order"></span>
+          <h2>HCL render</h2>
+          <p data-sub>demo_* · Terraform not run</p>
+        </article>
+      </div>
+      <div class="legend">
+        <span><i class="swatch now"></i>This step</span>
+        <span><i class="swatch trust"></i>Untrusted proposal</span>
+        <span><i class="swatch skip"></i>Not on this click</span>
+      </div>
+      <div class="states" id="states" aria-label="Plan status"></div>
+    </div>
+
+    <aside aria-live="polite">
+      <p class="kicker" id="kicker">POST /v1/plans</p>
+      <h2 id="title">Streamlit sends the prompt</h2>
+      <p class="body" id="body"></p>
+      <dl>
+        <dt>Status</dt>
+        <dd id="status-line"></dd>
+        <dt>Returns</dt>
+        <dd id="returns"></dd>
+        <dt>Not used</dt>
+        <dd id="unused"></dd>
+      </dl>
+    </aside>
+  </div>
+
+  <script>
+    const NODES = {
+      ui: "Streamlit",
+      route: "FastAPI route",
+      service: "PlanService",
+      planner: "Mock planner",
+      validate: "Validation",
+      policies: "Policies",
+      pricing: "Pricing",
+      hash: "Canonical hash",
+      store: "In-memory store",
+      artifact: "HCL render",
+    };
+
+    const SUBS = {
+      ui: "ui/app.py · HTTP only",
+      route: "app/main.py",
+      service: "owns the transition",
+      planner: "returns a JSON string",
+      validate: "parse and schema",
+      policies: "report only",
+      pricing: "synthetic Decimal",
+      hash: "SHA-256, written once",
+      store: "one process dict",
+      artifact: "demo_* · Terraform not run",
+    };
+
+    const FLOWS = {
+      generate: {
+        request: "POST /v1/plans",
+        from: "no record",
+        to: "evaluated",
+        returns: "201 PlanRecord. The UI shows the raw JSON, the proposal, six policy rows, and USD 71.00.",
+        steps: [
+          ["ui", "Streamlit sends the prompt", "Generate plan posts the text area. The page does not interpret infrastructure, apply policy, or compute a price. A selected demo scenario is prefixed as SCENARIO:<name>."],
+          ["route", "One route creates and evaluates", "The body is { \"prompt\": \"...\" }. The handler checks that the prompt is a non-blank string, then calls the service. Blank prompts are HTTP 422 and are not stored."],
+          ["service", "The service owns the sequence", "create_plan asks the planner for one string, then runs validation. Policy, price, and the hash run only when that string is a valid plan."],
+          ["planner", "An untrusted JSON string", "The sample prompt becomes region us-east-1, environment dev, one db-small, and two container-small. The planner does not validate or price that JSON. Words it does not know are ignored, so an unrelated sentence still becomes one small web container. SCENARIO: names skip the vocabulary and return a fixed fixture."],
+          ["validate", "Schema accepts the string", "json.loads, then ProposedPlan. Extra fields, missing fields, and bad types are kept as validation errors on a draft and still return 201. They are not repaired. This prompt is valid, so evaluation continues."],
+          ["policies", "Six checks, none of them edits", "Allowed region, required tags, quantity limits, dev SKU tier, public storage, and the dev medium-cost warning. This prompt passes all six. A warning would not block approval. An error would."],
+          ["pricing", "Synthetic monthly total 71", "Decimal values come from app/data/prices.json. Two container-small instances at 18, plus one db-small at 35, is 71. An unknown SKU fails the estimate and blocks approval. No cloud price API is called."],
+          ["hash", "The proposal is fingerprinted once", "plan_hash is the SHA-256 of the proposal only: region, environment, tags, and resources. Status, cost, and policy results are not inside it. Later clicks do not overwrite this value."],
+          ["store", "Saved as evaluated", "The record lives in a dict in this API process. A restart drops it. Approve is enabled because validation is clean, no policy is an error, and pricing succeeded."],
+        ],
+      },
+      approve: {
+        request: "POST /v1/plans/{id}/approve",
+        from: "evaluated",
+        to: "approved",
+        returns: "200 PlanRecord with status approved. A failed gate is 409 and the stored record is left unchanged.",
+        steps: [
+          ["ui", "Approve sends the stored hash", "The button is enabled only for an evaluated plan with a proposal, a hash, no validation errors, no policy error, and a successful price. The click posts the plan_hash from the last response. It does not send the prompt again."],
+          ["route", "The route forwards two inputs", "The path supplies the plan id. The body is { \"plan_hash\": \"<64 lowercase hex characters>\" }. The handler calls the service and maps a failed gate to HTTP 409."],
+          ["service", "Six gates, in order", "Status must be evaluated. The submitted hash must match the stored hash. A freshly computed hash of the stored proposal must match too. Validation errors must be empty. No policy result may be an error. Pricing must have succeeded. The planner is not called again."],
+          ["hash", "Recomputed, then thrown away", "The fresh hash is a freshness check. It is not written back. If the stored proposal was changed after evaluation, this gate fails even when the client sends the old hash."],
+          ["store", "Status becomes approved", "Only the status changes. The proposal, plan_hash, policy rows, and cost stay as they were at evaluation. Generate artifact is now the enabled next step."],
+        ],
+      },
+      reject: {
+        request: "POST /v1/plans/{id}/reject",
+        from: "evaluated",
+        to: "rejected",
+        terminal: true,
+        returns: "200 PlanRecord with status rejected. Approved, rejected, and artifact-generated plans return 409.",
+        steps: [
+          ["ui", "Reject sends the plan id only", "There is no hash in the request. The button is enabled for a draft or an evaluated plan, including plans that failed policy or pricing."],
+          ["route", "No request body", "POST /v1/plans/{id}/reject. The handler passes the id to the service."],
+          ["service", "No approval gates", "Draft and evaluated may become rejected. The service does not re-check the hash, policies, or price. Approved, rejected, and artifact-generated plans are refused."],
+          ["store", "Rejected is terminal", "The proposal, hash, validation errors, policy checks, and cost stay on the record. A new prompt is a new POST /v1/plans. This record cannot be approved or rendered."],
+        ],
+      },
+      artifact: {
+        request: "POST /v1/plans/{id}/artifact",
+        from: "approved",
+        to: "artifact_generated",
+        returns: "200 PlanRecord. The HCL is in the artifact field. Calling this route again is 409.",
+        steps: [
+          ["ui", "Enabled only after approval", "Generate artifact sends the plan id and no body. Draft, evaluated, and rejected plans keep the button disabled."],
+          ["route", "The route does not render", "POST /v1/plans/{id}/artifact. Rendering stays in the service, after the gates."],
+          ["service", "Approved, and still the same plan", "Status must be approved. The service also re-reads the stored validation, policy, and pricing results. A plan that is already artifact_generated is refused. Read the saved HCL with Refresh instead."],
+          ["hash", "The same freshness check", "The hash is computed again from the stored proposal and compared with plan_hash. It is not saved. Drift returns 409 and does not render."],
+          ["artifact", "Dry-run HCL, then stop", "Jinja2 renders fictional demo_* resources and a comment that nothing was deployed. Resource names are not aws_* or azurerm_*. Terraform is not executed."],
+          ["store", "The file body is stored", "Status becomes artifact_generated. The HCL is the record's artifact field. Download main.tf uses that string and does not call this route again."],
+        ],
+      },
+      refresh: {
+        request: "GET /v1/plans/{id}",
+        from: "evaluated",
+        to: "evaluated",
+        returns: "200 PlanRecord, unchanged. An unknown id, including every id after an API restart, is 404.",
+        steps: [
+          ["ui", "Refresh reloads the current id", "The button is enabled once a plan exists. It does not submit a prompt, a hash, or a decision."],
+          ["route", "A read, not a transition", "GET /v1/plans/{id}. The handler returns the stored record or 404."],
+          ["service", "get_plan does not evaluate", "No planner call, no policy, no price, and no new hash."],
+          ["store", "The dict is read", "Status, proposal, hash, and artifact come back as stored. Restarting the API clears the dict, so the same id then 404s."],
+        ],
+      },
+      download: {
+        request: "No HTTP request",
+        from: "artifact_generated",
+        to: "artifact_generated",
+        returns: "The browser saves the artifact field as main.tf. The API is not called.",
+        steps: [
+          ["ui", "The file is already on the record", "Download main.tf appears only after artifact is a non-empty string. The click saves that string locally. It does not generate, approve, or fetch again."],
+        ],
+      },
+    };
+
+    const stage = document.getElementById("stage");
+    const token = document.getElementById("token");
+    const titleEl = document.getElementById("title");
+    const bodyEl = document.getElementById("body");
+    const kickerEl = document.getElementById("kicker");
+    const statusEl = document.getElementById("status-line");
+    const returnsEl = document.getElementById("returns");
+    const unusedEl = document.getElementById("unused");
+    const statesEl = document.getElementById("states");
+    const counterEl = document.getElementById("counter");
+    const pauseBtn = document.getElementById("pause");
+
+    const flowButtons = [...document.querySelectorAll("[data-flow]")];
+    let flowName = "generate";
+    let index = 0;
+    let timer = null;
+    let paused = false;
+
+    function flow() {
+      return FLOWS[flowName];
+    }
+
+    function placeToken(nodeId, animate) {
+      const node = stage.querySelector(`[data-node="${nodeId}"]`);
+      if (!node) return;
+      const sr = stage.getBoundingClientRect();
+      const nr = node.getBoundingClientRect();
+      const x = nr.left - sr.left + nr.width / 2 - 9;
+      const y = nr.top - sr.top - 9;
+      if (!animate) token.style.transition = "none";
+      token.style.transform = `translate(${x}px, ${y}px)`;
+      if (!animate) {
+        token.getBoundingClientRect();
+        token.style.transition = "";
+      }
+    }
+
+    function render(animateToken) {
+      const current = flow();
+      const step = current.steps[index];
+      const onPath = new Set(current.steps.map((item) => item[0]));
+      document.querySelectorAll(".node").forEach((node) => {
+        const id = node.dataset.node;
+        node.classList.toggle("off", !onPath.has(id));
+        node.classList.toggle("current", id === step[0]);
+        const seen = current.steps.findIndex((item) => item[0] === id);
+        const visited = seen !== -1 && seen <= index;
+        node.classList.toggle("visited", visited);
+        node.querySelector(".order").textContent = visited ? String(seen + 1) : "";
+        node.querySelector("[data-sub]").textContent = SUBS[id];
+      });
+      placeToken(step[0], animateToken);
+      kickerEl.textContent = current.request;
+      titleEl.textContent = step[1];
+      bodyEl.textContent = step[2];
+      const terminal = current.terminal && index === current.steps.length - 1;
+      statusEl.innerHTML =
+        `<span class="status">${current.from}</span> to ` +
+        `<span class="status${terminal ? " terminal" : ""}">${current.to}</span>`;
+      returnsEl.textContent = current.returns;
+      const unused = Object.keys(NODES).filter((id) => !onPath.has(id)).map((id) => NODES[id]);
+      unusedEl.textContent = unused.length ? unused.join(", ") : "Every module on the board is on this click.";
+      counterEl.textContent = `Step ${index + 1} of ${current.steps.length}`;
+      statesEl.innerHTML =
+        `<span>Plan status</span> <strong>${current.from}</strong> <span>to</span> <strong>${current.to}</strong>`;
+      pauseBtn.textContent = paused ? "Resume" : "Pause";
+    }
+
+    function stop() {
+      if (timer !== null) {
+        clearInterval(timer);
+        timer = null;
+      }
+    }
+
+    function schedule() {
+      stop();
+      if (paused) return;
+      timer = setInterval(() => {
+        if (index >= flow().steps.length - 1) {
+          stop();
+          return;
+        }
+        index += 1;
+        render(true);
+      }, 1700);
+    }
+
+    function start(name, resetPause) {
+      flowName = name;
+      index = 0;
+      if (resetPause) paused = false;
+      flowButtons.forEach((button) => {
+        button.setAttribute("aria-pressed", button.dataset.flow === name ? "true" : "false");
+      });
+      render(false);
+      schedule();
+    }
+
+    flowButtons.forEach((button) => {
+      button.addEventListener("click", () => start(button.dataset.flow, true));
+    });
+
+    pauseBtn.addEventListener("click", () => {
+      paused = !paused;
+      if (paused) stop();
+      else schedule();
+      pauseBtn.textContent = paused ? "Resume" : "Pause";
+    });
+
+    document.getElementById("next").addEventListener("click", () => {
+      paused = true;
+      stop();
+      if (index < flow().steps.length - 1) index += 1;
+      render(true);
+    });
+
+    document.getElementById("replay").addEventListener("click", () => start(flowName, true));
+
+    document.addEventListener("keydown", (event) => {
+      if (event.target instanceof HTMLButtonElement && event.key === " ") return;
+      const number = Number(event.key);
+      if (number >= 1 && number <= 6) {
+        start(flowButtons[number - 1].dataset.flow, true);
+        return;
+      }
+      if (event.key === " ") {
+        event.preventDefault();
+        pauseBtn.click();
+      }
+      if (event.key === "ArrowRight") document.getElementById("next").click();
+    });
+
+    window.addEventListener("resize", () => placeToken(flow().steps[index][0], false));
+
+    start("generate", true);
+  </script>
+</body>
+</html>

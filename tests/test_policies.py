@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 
 from app.models import CheckStatus, Environment, PolicyCheck, ProposedPlan, Resource, ResourceType
@@ -12,14 +15,14 @@ _POLICY_ORDER = (
     "dev_medium_cost",
 )
 
-_CONTAINER_SKUS = "container-small and container-medium"
-_POSTGRES_SKUS = "db-small and db-medium"
+_CONTAINER_SKUS = "container-small, container-medium, and container-large"
+_POSTGRES_SKUS = "db-small, db-medium, and db-large"
 
 _LIMITS_PASSED = PolicyCheck(
     policy_id="resource_limits",
     status=CheckStatus.PASSED,
     message=(
-        "Container quantity, postgres quantity, and object storage capacity are within plan limits."
+        "Container, PostgreSQL, MySQL, and object storage capacity are within plan limits."
     ),
 )
 
@@ -156,7 +159,7 @@ def _violating_plan() -> ProposedPlan:
         region="eu-west-1",
         tags={"environment": "dev", "cost-center": "engineering"},
         resources=[
-            _container(name="web-a", sku="container-large", quantity=4),
+            _container(name="web-a", sku="container-xl", quantity=4),
             _container(name="web-b", sku="container-medium", quantity=2),
             _postgres(name="db-a", sku="db-medium", quantity=3),
             _postgres(name="db-b", sku="container-small", quantity=1),
@@ -503,7 +506,7 @@ def test_dev_small_skus_pass_without_warnings() -> None:
         PolicyCheck(
             policy_id="dev_sku_tier",
             status=CheckStatus.PASSED,
-            message="Dev container and postgres SKUs are allowed.",
+            message="Dev SKUs are allowed.",
         )
     ]
     assert _for(checks, "dev_medium_cost") == [
@@ -531,7 +534,7 @@ def test_dev_medium_skus_warn_without_errors() -> None:
 @pytest.mark.parametrize(
     ("resource", "allowed"),
     [
-        (_container(name="web", sku="container-large"), _CONTAINER_SKUS),
+        (_container(name="web", sku="container-xl"), _CONTAINER_SKUS),
         (_container(name="web", sku="container-small-extra"), _CONTAINER_SKUS),
         (_container(name="web", sku="container-medium-plus"), _CONTAINER_SKUS),
         (_container(name="web", sku="container-medium "), _CONTAINER_SKUS),
@@ -540,7 +543,7 @@ def test_dev_medium_skus_warn_without_errors() -> None:
         (_container(name="web", sku="db-medium"), _CONTAINER_SKUS),
         (_container(name="web", sku="storage-standard"), _CONTAINER_SKUS),
         (_container(name="web", sku="small"), _CONTAINER_SKUS),
-        (_postgres(name="database", sku="db-large"), _POSTGRES_SKUS),
+        (_postgres(name="database", sku="db-xl"), _POSTGRES_SKUS),
         (_postgres(name="database", sku="db-smallish"), _POSTGRES_SKUS),
         (_postgres(name="database", sku=" db-medium"), _POSTGRES_SKUS),
         (_postgres(name="database", sku="container-small"), _POSTGRES_SKUS),
@@ -560,9 +563,9 @@ def test_each_disallowed_dev_sku_is_reported_in_resource_order() -> None:
             _plan(
                 resources=[
                     _storage(name="assets", sku="storage-large"),
-                    _container(name="web", sku="container-large"),
+                    _container(name="web", sku="container-xl"),
                     _postgres(name="database", sku="db-small"),
-                    _postgres(name="analytics", sku="db-large"),
+                    _postgres(name="analytics", sku="db-xl"),
                 ]
             )
         ),
@@ -661,7 +664,7 @@ def test_multiple_violations_are_returned_together() -> None:
             message="Total object storage capacity is 550 GB, which exceeds the maximum of 500 GB.",
             field_path="resources",
         ),
-        _sku_error(_container(name="web-a", sku="container-large"), _CONTAINER_SKUS, index=0),
+        _sku_error(_container(name="web-a", sku="container-xl"), _CONTAINER_SKUS, index=0),
         _sku_error(_postgres(name="db-b", sku="container-small"), _POSTGRES_SKUS, index=3),
         PolicyCheck(
             policy_id="storage_public",
@@ -689,6 +692,45 @@ def test_results_are_deterministic_and_input_is_unchanged() -> None:
     assert [id(resource) for resource in plan.resources] == resource_ids
     assert [check.model_dump() for check in first] == [check.model_dump() for check in second]
     assert first == _evaluate(plan)
+
+
+def test_policy_file_can_remove_an_allowed_region(tmp_path: Path) -> None:
+    source = json.loads(
+        (Path(__file__).resolve().parents[1] / "app" / "data" / "policy.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    source["allowed_regions"] = ["us-west-2"]
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(source), encoding="utf-8")
+
+    checks = evaluate_policies(_plan(region="us-east-1"), config_path=path)
+
+    assert _for(checks, "allowed_regions")[0].status is CheckStatus.ERROR
+    assert "us-west-2" in _for(checks, "allowed_regions")[0].message
+
+
+def test_configured_large_database_warns_and_mysql_is_limited() -> None:
+    database = _postgres(name="database", sku="db-large")
+    mysql = Resource(
+        type=ResourceType.MYSQL,
+        name="mysql",
+        sku="mysql-large",
+        quantity=3,
+    )
+    checks = _evaluate(_plan(resources=[database, mysql]))
+
+    assert _for(checks, "dev_sku_tier")[0].status is CheckStatus.PASSED
+    assert _for(checks, "dev_medium_cost")[0].status is CheckStatus.WARNING
+    assert "higher-cost" in _for(checks, "dev_medium_cost")[0].message
+    assert _for(checks, "resource_limits") == [
+        PolicyCheck(
+            policy_id="resource_limits",
+            status=CheckStatus.ERROR,
+            message="Total mysql quantity is 3, which exceeds the maximum of 2.",
+            field_path="resources",
+        )
+    ]
 
 
 def test_missing_storage_capacity_fails_closed() -> None:

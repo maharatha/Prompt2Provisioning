@@ -15,9 +15,10 @@ from app.models import ProposedPlan, Resource, ResourceType
 _DEMO_RESOURCE_TYPE = {
     ResourceType.CONTAINER: "demo_container",
     ResourceType.POSTGRES: "demo_postgres",
+    ResourceType.MYSQL: "demo_mysql",
     ResourceType.OBJECT_STORAGE: "demo_object_storage",
 }
-_LABEL_RE = re.compile(r"^(?:container|postgres|object_storage)_[0-9]+$")
+_LABEL_RE = re.compile(r"^(?:container|postgres|mysql|object_storage)_[0-9]+$")
 
 
 def render_artifact(proposed: ProposedPlan) -> str:

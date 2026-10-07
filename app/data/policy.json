@@ -1,0 +1,20 @@
+{
+  "allowed_regions": ["us-east-1", "us-west-2", "eastus2"],
+  "required_tags": ["environment", "owner", "cost-center"],
+  "quantity_limits": {
+    "container": 5,
+    "postgres": 2,
+    "mysql": 2
+  },
+  "object_storage_capacity_gb": 500,
+  "dev_allowed_skus": {
+    "container": ["container-small", "container-medium", "container-large"],
+    "postgres": ["db-small", "db-medium", "db-large"],
+    "mysql": ["mysql-small", "mysql-medium", "mysql-large"]
+  },
+  "dev_warning_skus": {
+    "container": ["container-medium", "container-large"],
+    "postgres": ["db-medium", "db-large"],
+    "mysql": ["mysql-medium", "mysql-large"]
+  }
+}

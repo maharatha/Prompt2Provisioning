@@ -1,11 +1,18 @@
 {
   "container": {
     "container-small": "18",
-    "container-medium": "42"
+    "container-medium": "42",
+    "container-large": "96"
   },
   "postgres": {
     "db-small": "35",
-    "db-medium": "95"
+    "db-medium": "95",
+    "db-large": "240"
+  },
+  "mysql": {
+    "mysql-small": "49",
+    "mysql-medium": "140",
+    "mysql-large": "320"
   },
   "object_storage": {
     "storage-standard": "0.025"

@@ -227,6 +227,31 @@ def test_owner_and_cost_center_are_not_read_from_the_prompt(planner: MockPlanner
     }
 
 
+def test_big_database_stays_large_beside_low_cost(planner: MockPlanner) -> None:
+    payload = _load(
+        planner.generate(
+            "A big PostgreSQL database and two web containers for a development team "
+            "in US East, optimized for low cost."
+        )
+    )
+    assert payload["region"] == "us-east-1"
+    assert payload["environment"] == "dev"
+    assert [
+        (resource["type"], resource["sku"], resource["quantity"])
+        for resource in _resources(payload)
+    ] == [
+        ("postgres", "db-large", 1),
+        ("container", "container-small", 2),
+    ]
+
+    large = _load(planner.generate("two large web containers"))
+    assert _resources(large)[0]["sku"] == "container-large"
+
+    mysql = _load(planner.generate("a large mysql database in US East"))
+    assert _resources(mysql)[0]["type"] == "mysql"
+    assert _resources(mysql)[0]["sku"] == "mysql-large"
+
+
 def test_low_cost_uses_small_skus_without_replacing_medium(planner: MockPlanner) -> None:
     low_cost = _load(planner.generate("two web containers optimized for low cost"))
     assert _resources(low_cost)[0]["sku"] == "container-small"
@@ -292,6 +317,47 @@ def test_storage_without_object_storage_is_not_a_bucket(planner: MockPlanner) ->
     resource = _resources(payload)[0]
     assert resource["type"] == "container"
     assert "capacity_gb" not in resource
+
+
+def test_unknown_region_phrase_is_an_interpretation_error(planner: MockPlanner) -> None:
+    prompt = (
+        "A small PostgreSQL database and two web containers for a development team "
+        "in US NORTH, optimized for low cost."
+    )
+    payload = _load(planner.generate(prompt))
+    assert "region" not in payload
+    assert payload["interpretation_error"] == (
+        "Unrecognized region 'US NORTH'. "
+        "Recognized regions are US East, US West, and Azure East US."
+    )
+
+    south = _load(planner.generate("one database in US South"))
+    assert "US South" in south["interpretation_error"]
+    earlier = _load(planner.generate("one database in US North or US East"))
+    assert "US North" in earlier["interpretation_error"]
+    azure = _load(planner.generate("one database in Azure West US"))
+    assert "Azure West US" in azure["interpretation_error"]
+
+
+def test_region_aliases_and_extra_phrases(planner: MockPlanner) -> None:
+    oregon = _load(planner.generate("a couple of websites in Oregon"))
+    assert oregon["region"] == "us-west-2"
+    web = _resources(oregon)[0]
+    assert web["type"] == "container"
+    assert web["quantity"] == 2
+
+    virginia = _load(planner.generate("a single database in Northern Virginia"))
+    assert virginia["region"] == "us-east-1"
+    assert _resources(virginia)[0]["quantity"] == 1
+
+    azure = _load(planner.generate("100 GB blob storage in East US 2"))
+    assert azure["region"] == "eastus2"
+    assert _resources(azure)[0]["type"] == "object_storage"
+    assert _resources(azure)[0]["capacity_gb"] == 100
+
+    bucket = _load(planner.generate("s3 in us-west-2"))
+    assert bucket["region"] == "us-west-2"
+    assert _resources(bucket)[0]["type"] == "object_storage"
 
 
 def test_region_phrases_need_the_documented_wording(planner: MockPlanner) -> None:
@@ -365,11 +431,11 @@ def test_unsupported_sku_scenario_keeps_container_large(planner: MockPlanner) ->
     )
     resources = _resources(payload)
     assert len(resources) == 1
-    assert resources[0]["sku"] == "container-large"
+    assert resources[0]["sku"] == "container-xl"
     assert resources[0]["sku"] != "container-small"
     plan = ProposedPlan.model_validate(payload)
     assert plan.environment is Environment.PROD
-    assert plan.resources[0].sku == "container-large"
+    assert plan.resources[0].sku == "container-xl"
 
 
 def test_excessive_quantity_scenario_emits_six_containers(planner: MockPlanner) -> None:

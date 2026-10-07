@@ -239,6 +239,61 @@ def test_policy_failures_cannot_be_approved(api, prompt: str) -> None:
     assert client.get(f"/v1/plans/{created['id']}").json()["status"] == "evaluated"
 
 
+def test_unknown_region_wording_cannot_be_approved(api) -> None:
+    client, _store, _service = api
+    created = _create(
+        client,
+        "A small PostgreSQL database and two web containers for a development team "
+        "in US NORTH, optimized for low cost.",
+    )
+    assert created["status"] == "draft"
+    assert created["proposed"] is None
+    assert created["plan_hash"] is None
+    messages = [issue["message"] for issue in created["validation_errors"]]
+    assert any("US NORTH" in message for message in messages)
+    assert all("us-east-1" not in message for message in messages)
+
+    refused = client.post(
+        f"/v1/plans/{created['id']}/approve",
+        json={"plan_hash": WRONG_HASH},
+    )
+    _assert_service_error(refused, 409, "status")
+    assert client.get(f"/v1/plans/{created['id']}").json()["status"] == "draft"
+
+
+def test_big_dev_database_is_not_rewritten_as_small(api) -> None:
+    client, _store, _service = api
+    created = _create(
+        client,
+        "A big PostgreSQL database and two web containers for a development team "
+        "in US East, optimized for low cost.",
+    )
+    assert created["status"] == "evaluated"
+    proposed = created["proposed"]
+    assert isinstance(proposed, dict)
+    database = proposed["resources"][0]
+    assert database["sku"] == "db-large"
+    assert any(
+        check["policy_id"] == "dev_sku_tier" and check["status"] == "passed"
+        for check in created["policy_checks"]
+    )
+    assert any(
+        check["policy_id"] == "dev_medium_cost" and check["status"] == "warning"
+        for check in created["policy_checks"]
+    )
+    cost = created["cost"]
+    assert isinstance(cost, dict)
+    assert cost["succeeded"] is True
+    assert cost["monthly_total"] == "276"
+
+    approved = client.post(
+        f"/v1/plans/{created['id']}/approve",
+        json={"plan_hash": created["plan_hash"]},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approved"
+
+
 def test_pricing_failure_cannot_be_approved(api) -> None:
     client, _store, _service = api
     created = _create(client, "SCENARIO:unsupported_sku")
@@ -499,6 +554,104 @@ def test_unrelated_planner_value_error_is_not_an_input_error(api) -> None:
     client = TestClient(app)
     with pytest.raises(ValueError, match="not a scenario failure"):
         client.post("/v1/plans", json={"prompt": "two web containers"})
+
+
+def test_model_api_key_is_not_stored(api, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, store, _service = api
+    secret = "sk-demo-secret-do-not-store"
+
+    def fake(provider: str, model: str | None, api_key: str | None, prompt: str, **_kwargs: object) -> str:
+        assert provider == "openai"
+        assert model == "gpt-4.1-mini"
+        assert api_key == secret
+        assert secret not in prompt
+        return '{"interpretation_error":"Unrecognized region \'nowhere\'."}'
+
+    monkeypatch.setattr("app.main.complete_plan", fake)
+    response = client.post(
+        "/v1/plans",
+        json={
+            "prompt": "one database in nowhere",
+            "provider": "openai",
+            "model": "gpt-4.1-mini",
+            "api_key": secret,
+        },
+    )
+    assert response.status_code == 201
+    assert secret not in response.text
+    body = response.json()
+    assert body["generator"] == "openai:gpt-4.1-mini"
+    assert body["status"] == "draft"
+    stored = store.get(UUID(str(body["id"])))
+    assert stored is not None
+    assert secret not in stored.model_dump_json()
+
+
+def test_provider_failure_stores_nothing(api, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, store, _service = api
+    secret = "sk-demo-secret-do-not-store"
+
+    def fake(*_args: object, **_kwargs: object) -> str:
+        from app.llm import ProviderError
+
+        raise ProviderError("The model provider returned HTTP 401.")
+
+    monkeypatch.setattr("app.main.complete_plan", fake)
+    response = client.post(
+        "/v1/plans",
+        json={
+            "prompt": "one database",
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "api_key": secret,
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["code"] == "provider_error"
+    assert secret not in response.text
+    assert store.list_records() == []
+
+
+def test_missing_model_key_stores_nothing(api) -> None:
+    client, store, _service = api
+    response = client.post(
+        "/v1/plans",
+        json={"prompt": "one database", "provider": "openai", "model": "gpt-5"},
+    )
+    assert response.status_code == 422
+    assert response.json()["code"] == "provider_error"
+    assert store.list_records() == []
+
+
+def test_decisions_keep_approved_and_rejected_plans(api) -> None:
+    client, _store, _service = api
+    approved = _create(client, EXAMPLE_PROMPT)
+    client.post(
+        f"/v1/plans/{approved['id']}/approve",
+        json={"plan_hash": approved["plan_hash"]},
+    )
+    rejected = _create(client, "one database in US West")
+    client.post(f"/v1/plans/{rejected['id']}/reject")
+    draft = _create(client, "SCENARIO:malformed")
+
+    response = client.get("/v1/decisions")
+    assert response.status_code == 200
+    listed = {item["id"]: item["status"] for item in response.json()}
+    assert listed[approved["id"]] == "approved"
+    assert listed[rejected["id"]] == "rejected"
+    assert draft["id"] not in listed
+    assert all("api_key" not in item for item in response.json())
+
+
+def test_catalog_endpoints_return_the_json_files(api) -> None:
+    client, _store, _service = api
+    prices = client.get("/v1/catalog/prices")
+    policy = client.get("/v1/catalog/policy")
+    assert prices.status_code == 200
+    assert policy.status_code == 200
+    assert prices.json()["postgres"]["db-large"] == "240"
+    assert "us-east-1" in policy.json()["allowed_regions"]
+    assert "db-large" in policy.json()["dev_allowed_skus"]["postgres"]
 
 
 def test_schema_endpoint_matches_proposed_plan_schema(api) -> None:

@@ -259,6 +259,9 @@ def test_initial_page_shows_the_prototype_notice_and_example(planner: AppTest) -
     assert "prototype" in text.lower()
     assert "synthetic" in text.lower()
     assert "Nothing was deployed." in text
+    assert "not saved on the plan" in text
+    assert "not the person who accepts" in text
+    assert planner.selectbox(key="planner_provider").value == "Built-in"
     assert planner.text_area[0].value == ASSIGNMENT_EXAMPLE
     assert EXAMPLE_PROMPT == ASSIGNMENT_EXAMPLE
     assert planner.selectbox(key="scenario").options == ["None", *SCENARIO_TOKENS]

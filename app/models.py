@@ -20,6 +20,7 @@ def utc_now() -> datetime:
 class ResourceType(StrEnum):
     CONTAINER = "container"
     POSTGRES = "postgres"
+    MYSQL = "mysql"
     OBJECT_STORAGE = "object_storage"
 
 
@@ -184,6 +185,7 @@ class PlanRecord(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     prompt: str
     raw_output: str
+    generator: str = "mock"
     status: PlanStatus = PlanStatus.DRAFT
     proposed: ProposedPlan | None = None
     plan_hash: str | None = None
@@ -198,3 +200,8 @@ class PlanRecord(BaseModel):
     @classmethod
     def validate_prompt(cls, value: str) -> str:
         return _require_nonblank(value, field_name="prompt")
+
+    @field_validator("generator")
+    @classmethod
+    def validate_generator(cls, value: str) -> str:
+        return _require_nonblank(value, field_name="generator")

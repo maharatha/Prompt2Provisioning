@@ -6,12 +6,16 @@ await during a create, approval, rejection, or artifact transition. This
 prototype does not lock the in-memory store.
 """
 
+import json
+from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from app.llm import ProviderError, complete_plan
 from app.models import PlanRecord, ProposedPlan
 from app.planner import UnknownScenarioError
 from app.services import PlanNotFound, PlanService, ServiceError
@@ -46,6 +50,9 @@ class CreatePlanRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     prompt: str
+    provider: Literal["mock", "openai", "claude"] = "mock"
+    model: str | None = None
+    api_key: str | None = None
 
     @field_validator("prompt")
     @classmethod
@@ -76,6 +83,14 @@ async def handle_service_error(_request: Request, exc: ServiceError) -> JSONResp
     return JSONResponse(
         status_code=exc.http_status,
         content=_error_content(exc.code, exc.message),
+    )
+
+
+@app.exception_handler(ProviderError)
+async def handle_provider_error(_request: Request, exc: ProviderError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content=_error_content("provider_error", f"provider_error: {exc.message}"),
     )
 
 
@@ -114,7 +129,14 @@ async def create_plan(
 
     Invalid planner JSON is persisted as a draft and returned with 201.
     """
-    return service.create_plan(body.prompt)
+    if body.provider == "mock":
+        return service.create_plan(body.prompt)
+    raw_output = complete_plan(body.provider, body.model, body.api_key, body.prompt)
+    return service.create_plan(
+        body.prompt,
+        raw_output=raw_output,
+        generator=f"{body.provider}:{body.model}",
+    )
 
 
 @app.get(
@@ -167,6 +189,37 @@ async def generate_artifact(
     service: PlanService = Depends(get_plan_service),
 ) -> PlanRecord:
     return service.generate_artifact(plan_id)
+
+
+@app.get("/v1/decisions", response_model=list[PlanRecord])
+async def list_decisions(
+    service: PlanService = Depends(get_plan_service),
+) -> list[PlanRecord]:
+    """Return plans a reviewer has approved or rejected.
+
+    Artifact plans are included because approval already happened.
+    """
+    return service.list_decisions()
+
+
+def _catalog(name: str) -> dict[str, object]:
+    path = Path(__file__).resolve().parent / "data" / name
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{name} is not a JSON object")
+    return payload
+
+
+@app.get("/v1/catalog/prices")
+async def price_catalog() -> dict[str, object]:
+    """Return the synthetic price table. Rates stay JSON strings."""
+    return _catalog("prices.json")
+
+
+@app.get("/v1/catalog/policy")
+async def policy_catalog() -> dict[str, object]:
+    """Return the policy allow-lists. The check functions still apply them."""
+    return _catalog("policy.json")
 
 
 @app.get("/v1/schema/plan")

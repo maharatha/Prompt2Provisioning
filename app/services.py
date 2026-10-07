@@ -59,8 +59,16 @@ class PlanService:
         self._store = store
         self._planner = MockPlanner() if planner is None else planner
 
-    def create_plan(self, prompt: str) -> PlanRecord:
-        raw_output = self._planner.generate(prompt)
+    def create_plan(
+        self,
+        prompt: str,
+        *,
+        raw_output: str | None = None,
+        generator: str = "mock",
+    ) -> PlanRecord:
+        if raw_output is None:
+            raw_output = self._planner.generate(prompt)
+            generator = "mock"
         validation = validate_raw_plan(raw_output)
         proposed = validation.proposed
         if proposed is None:
@@ -68,6 +76,7 @@ class PlanService:
                 PlanRecord(
                     prompt=prompt,
                     raw_output=raw_output,
+                    generator=generator,
                     status=PlanStatus.DRAFT,
                     validation_errors=list(validation.errors),
                 )
@@ -77,6 +86,7 @@ class PlanService:
             PlanRecord(
                 prompt=prompt,
                 raw_output=raw_output,
+                generator=generator,
                 status=PlanStatus.EVALUATED,
                 proposed=proposed,
                 plan_hash=canonical_hash(proposed),
@@ -84,6 +94,22 @@ class PlanService:
                 cost=estimate_cost(proposed),
             )
         )
+
+    def list_decisions(self) -> list[PlanRecord]:
+        """Return approved, rejected, and artifact plans, newest first.
+
+        Drafts and unevaluated reviews stay in the store and are omitted here.
+        """
+        decided = {
+            PlanStatus.APPROVED,
+            PlanStatus.REJECTED,
+            PlanStatus.ARTIFACT_GENERATED,
+        }
+        records = [
+            record for record in self._store.list_records() if record.status in decided
+        ]
+        records.sort(key=lambda record: record.updated_at, reverse=True)
+        return records
 
     def get_plan(self, plan_id: UUID) -> PlanRecord | None:
         return self._store.get(plan_id)

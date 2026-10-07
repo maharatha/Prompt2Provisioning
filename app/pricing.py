@@ -14,7 +14,9 @@ from app.models import CostEstimate, CostLineItem, ProposedPlan, Resource, Resou
 
 _CATALOG_PATH = Path(__file__).resolve().parent / "data" / "prices.json"
 _Catalog = dict[str, dict[str, Decimal]]
-_INSTANCE_TYPES = frozenset({ResourceType.CONTAINER, ResourceType.POSTGRES})
+_INSTANCE_TYPES = frozenset(
+    {item for item in ResourceType if item is not ResourceType.OBJECT_STORAGE}
+)
 
 
 class _CatalogError(Exception):

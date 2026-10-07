@@ -108,9 +108,13 @@ Flat layout under `app/`, `ui/`, and `tests/`. No `src/` tree, no domain/infrast
 7. Approve submits the `plan_hash` from that response. Reject submits the plan id only.
 8. Artifact generation runs only after approval and a second hash check. It stores the HCL on the record and sets `artifact_generated`. The artifact route returns that updated record. A rejected plan cannot generate an artifact. Generating again is refused; the stored HCL is read with `GET /v1/plans/{plan_id}`.
 
-Vocabulary covers postgres/database, container/web application, object storage, dev/test/prod, US East → `us-east-1`, US West → `us-west-2`, Azure East US → `eastus2`, small/medium/low cost, and quantities one/two/three.
+Vocabulary covers postgres/database, mysql, container/web application/website, object storage/blob storage, dev/test/prod, US East or Northern Virginia → `us-east-1`, US West or Oregon → `us-west-2`, Azure East US → `eastus2`, small/medium/big/large/low cost, and quantities one/single/two/pair/couple/three. Policy allow-lists are in `app/data/policy.json`. Prices, including the higher large and MySQL rates, are in `app/data/prices.json`. A prompt with no region phrase still uses `us-east-1`. Another `US` or `Azure` region phrase, for example `US NORTH`, is an interpretation error. Validation stores a draft and approval is refused.
 
-If the prompt contains `SCENARIO:<name>`, vocabulary parsing is skipped and a fixed string is returned. Names: `malformed`, `missing_region`, `missing_tags`, `unknown_type`, `unsupported_sku`, `excessive_qty`, `public_storage`. Scenario payloads are not repaired.
+The same request can optionally be sent to OpenAI (`gpt-5`) or Anthropic (`claude-sonnet-5-5`). The person chooses the provider. The model is fixed. The key is not stored. The returned text is still an untrusted string, and the checks below are unchanged. `GET /v1/decisions` lists plans whose status is `approved`, `rejected`, or `artifact_generated`. `GET /v1/catalog/prices` and `GET /v1/catalog/policy` return the JSON tables the UI shows.
+
+Changing the prompt creates a new plan. Reject does not edit the request. It records that this plan must not be approved.
+
+If the prompt contains `SCENARIO:<name>`, vocabulary parsing is skipped and a fixed string is returned. It applies to the built-in planner. Names: `malformed`, `missing_region`, `missing_tags`, `unknown_type`, `unsupported_sku`, `excessive_qty`, `public_storage`. Scenario payloads are not repaired.
 
 ## States
 

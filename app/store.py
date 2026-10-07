@@ -45,3 +45,6 @@ class InMemoryStore:
 
     def clear(self) -> None:
         self._records.clear()
+
+    def list_records(self) -> list[PlanRecord]:
+        return [record.model_copy(deep=True) for record in self._records.values()]

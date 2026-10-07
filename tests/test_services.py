@@ -169,7 +169,7 @@ def test_unknown_sku_is_evaluated_with_failed_pricing() -> None:
 
     assert record.status is PlanStatus.EVALUATED
     assert record.proposed is not None
-    assert record.proposed.resources[0].sku == "container-large"
+    assert record.proposed.resources[0].sku == "container-xl"
     assert record.plan_hash == canonical_hash(record.proposed)
     assert record.validation_errors == []
     assert record.cost is not None

@@ -110,6 +110,16 @@ def test_valid_mock_output(planner: MockPlanner) -> None:
     assert all(resource.public_access is False for resource in plan.resources)
 
 
+def test_unrecognized_region_is_one_validation_issue(planner: MockPlanner) -> None:
+    result = validate_raw_plan(planner.generate("one database in US NORTH"))
+    assert result.proposed is None
+    assert len(result.errors) == 1
+    issue = result.errors[0]
+    assert issue.code == "unrecognized_input"
+    assert issue.field_path == "region"
+    assert "US NORTH" in issue.message
+
+
 def test_malformed_json_is_a_validation_failure(planner: MockPlanner) -> None:
     result = validate_raw_plan(planner.generate("one database", scenario="malformed_json"))
 
@@ -256,7 +266,7 @@ def test_schema_valid_negative_scenarios_pass_through_unchanged(
         assert plan.resources[0].sku == "container-small"
     elif scenario == "unsupported_sku":
         assert plan.environment is Environment.PROD
-        assert plan.resources[0].sku == "container-large"
+        assert plan.resources[0].sku == "container-xl"
     elif scenario == "excessive_quantity":
         assert plan.resources[0].type is ResourceType.CONTAINER
         assert plan.resources[0].quantity == 6

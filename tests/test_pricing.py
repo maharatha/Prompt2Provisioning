@@ -205,11 +205,30 @@ def test_mixed_resources_keep_fractional_precision() -> None:
 
 
 def test_unknown_sku_alone_produces_no_estimate() -> None:
-    result = estimate_cost(_plan([_container(name="web", sku="container-large", quantity=2)]))
+    result = estimate_cost(_plan([_container(name="web", sku="container-xl", quantity=2)]))
     _assert_no_estimate(result)
     assert any(
-        "unknown SKU 'container-large'" in error and "web" in error
+        "unknown SKU 'container-xl'" in error and "web" in error
         for error in result.pricing_errors
+    )
+
+
+def test_large_and_mysql_skus_use_the_higher_rates() -> None:
+    result = estimate_cost(
+        _plan(
+            [
+                _postgres(name="database", sku="db-large", quantity=1),
+                _container(name="web", sku="container-large", quantity=2),
+            ]
+        )
+    )
+    _assert_success(
+        result,
+        "432",
+        [
+            ("database", "db-large", 1, "240", "240"),
+            ("web", "container-large", 2, "96", "192"),
+        ],
     )
 
 
@@ -217,12 +236,12 @@ def test_unknown_sku_alongside_priced_resources_produces_no_estimate() -> None:
     plan = _plan(
         [
             _postgres(name="database", sku="db-small", quantity=1),
-            _container(name="web", sku="container-large", quantity=2),
+            _container(name="web", sku="container-xl", quantity=2),
         ]
     )
     result = estimate_cost(plan)
     _assert_no_estimate(result)
-    assert any("container-large" in error for error in result.pricing_errors)
+    assert any("container-xl" in error for error in result.pricing_errors)
     assert result.monthly_total != Decimal("35")
     assert result.monthly_total != Decimal("71")
 
@@ -309,10 +328,17 @@ def test_catalog_file_stores_rates_as_strings() -> None:
         "container": {
             "container-small": "18",
             "container-medium": "42",
+            "container-large": "96",
         },
         "postgres": {
             "db-small": "35",
             "db-medium": "95",
+            "db-large": "240",
+        },
+        "mysql": {
+            "mysql-small": "49",
+            "mysql-medium": "140",
+            "mysql-large": "320",
         },
         "object_storage": {
             "storage-standard": "0.025",
