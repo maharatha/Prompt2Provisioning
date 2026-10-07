@@ -1886,38 +1886,42 @@ it does not deploy anything.
 There is no database. The prompt, the plan, the decision, and the dry-run file
 live in a dictionary inside the API process. Restarting the API deletes them.
 An OpenAI or Anthropic key is sent with that one request and is not written to
-the plan, the logs, or disk. Log lines name the plan id and the outcome. They
-omit the sentence and the key, and they end when the API process ends.
-`prices.json` and `policy.json` ship with the repository. They are the rate
-table and the allow-lists, not a history of requests. The downloaded `main.tf`
-stays on your computer. Terraform is not run.
+the plan, the logs, or disk. Log lines name the plan id, the outcome, and how
+long a model call took. They omit the sentence and the key, and they end when
+the API process ends. `prices.json`, `policy.json`, and `lexicon.json` ship
+with the repository. They are the rate table, the allow-lists, and the planner
+vocabulary, not a history of requests. The downloaded `main.tf` stays on your
+computer. Terraform is not run.
 
 ### What happens to a request
 
-1. Streamlit sends the text to the API over HTTP. The page does not plan, price, or approve on its own.
-2. The built-in planner returns one JSON string from a phrase list. OpenAI (`gpt-5`) or Anthropic (`claude-sonnet-5-5`) can interpret the sentence instead. The API key is sent with that request and is not stored. The returned string is untrusted. The planner does not validate it, price it, or repair it.
+1. You write at least 30 characters. Generate plan turns on as you type, and a centred spinner shows while the plan is made. Streamlit sends the text to the API over HTTP. The page does not plan, price, or approve on its own.
+2. The built-in planner returns one JSON string. It first rewrites DevOps wording (`rds`, `pods`, `uat`, `iad`, `api x3`), corrects one-letter typos (`dataabse`), and refuses what it cannot build (Redis, VMs, Frankfurt) instead of dropping it. OpenAI (`gpt-5`) or Anthropic (`claude-sonnet-5-5`) can interpret the sentence instead, with JSON-only output and low reasoning effort. The API key is sent with that request and is not stored. Whichever planner runs, the returned string is untrusted. It is not validated, priced, or repaired by the planner.
 3. The API parses the JSON against a strict schema. Invalid JSON is stored as a draft and still returned. Missing fields are not filled in.
-4. A valid plan is checked by six policies and priced from a local synthetic catalog. The proposal is then hashed. The hash is written once.
-5. The same person approves or rejects. Changing the request makes a new plan. Reject records that this plan must not proceed. Approve resubmits the stored hash, and the API recomputes the hash to confirm the proposal has not changed. Reject sends only the plan id. Approved and rejected plans stay in the decision log.
+4. A valid plan is checked by six policies and priced from a local synthetic catalog. The proposal is then hashed. The hash is written once. The API also records two reviewer notes. **How the request was read** lists every rewrite the planner applied, or, for a model plan, how it differs from the built-in reading. **Defaults the plan used** lists every region, environment, size, capacity, or tag the request did not state.
+5. The review opens with a coloured banner: red for *Not a valid plan* or *Blocked*, amber for *Approvable with warnings*, green for *Ready for approval*. The stepper marks where a plan stopped. The same person approves or rejects. Changing the request makes a new plan. Approve resubmits the stored hash, and the API recomputes the hash to confirm the proposal has not changed. Reject sends only the plan id. Approved and rejected plans stay in the decision log.
 6. After approval, the API can render a dry-run Terraform-style file. The resources are fictional `demo_*` blocks. Terraform is not executed.
 
 ### Architecture
 
-One FastAPI process owns the rules. One Streamlit process is the client. Plan state is a dictionary in the API process. Restarting the API drops every plan. The API writes a log line to its own stderr for each create, approval, rejection, artifact, and refusal. That line names the plan and the outcome. It does not include the request body or an API key.
+One FastAPI process owns the rules. One Streamlit process is the client. Plan state is a dictionary in the API process. Restarting the API drops every plan. The API writes a log line to its own stderr for each create, approval, rejection, artifact, refusal, and model call. That line names the plan and the outcome. It does not include the request body or an API key.
 
 | Piece | Role |
 |---|---|
-| `ui/app.py` | HTTP client. Shows the plan and sends approve, reject, and artifact calls. |
-| `app/main.py` | Routes. They validate the HTTP body and call the service. |
-| `app/planner.py` | Untrusted proposal. Returns a JSON string only. |
+| `ui/app.py` | HTTP client. Shows the plan, banners, and notes, and sends approve, reject, and artifact calls. |
+| `app/main.py` | Routes. They validate the HTTP body (30 to 2,000 characters) and call the service. |
+| `app/planner.py` | Untrusted proposal. Returns a JSON string only, and lists the rewrites it applied. |
+| `app/lexicon.py` | DevOps synonyms, quantity phrasing, and one-letter typo correction from `lexicon.json`. |
+| `app/llm.py` | Optional OpenAI or Anthropic call. Returns one untrusted string. |
 | `app/validation.py` | Parses JSON and checks the schema. Does not change invalid input. |
 | `app/policies.py` | Reports pass, warning, or error. Does not edit the plan. |
 | `app/pricing.py` | Synthetic monthly estimate, using `Decimal`. An unknown SKU fails the estimate. |
 | `app/hashing.py` | Canonical SHA-256 of the proposal. |
+| `app/services.py` | Owns the plan lifecycle, and records the reviewer notes and defaults. |
 | `app/artifacts.py` | Renders HCL only when the service has already approved the plan. |
 | `app/store.py` | In-memory get and put. |
 
-The planner may mention tags that happen to satisfy policy. Policy code still evaluates them. A prompt that matches no known resource, such as “build a rocket,” becomes a draft with an `unrecognized_input` error on `resources`. The planner does not guess a resource.
+The planner may mention tags that happen to satisfy policy. Policy code still evaluates them, and the defaults box says when a tag was not in the request. A prompt that matches no known resource, such as “build a rocket,” becomes a draft with an `unrecognized_input` error on `resources`. A misspelling too far to correct safely, such as “datbse”, is refused with a suggestion. The planner never guesses a resource or drops one silently.
 
 Data moves in one direction. The page posts the sentence. The planner returns a string. Schema, policy, and price decide. The hash is stored once. Approve and the artifact both recompute that hash and refuse the plan if it no longer matches. The Prices and Policies pages read the same JSON catalogs the checks use.
 

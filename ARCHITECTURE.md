@@ -17,7 +17,9 @@ Implementation then proceeds by prompting against this document, one slice at a 
 ### In scope
 
 - Accept one natural-language prompt and return a persisted plan.
-- Propose plan JSON from a deterministic mock planner with a small vocabulary, plus fixed `SCENARIO:` payloads for invalid and edge cases.
+- Propose plan JSON from a deterministic mock planner with a small vocabulary, plus fixed `SCENARIO:` payloads for invalid and edge cases. A DevOps lexicon rewrites synonyms, quantity phrasing, and one-letter typos first, and every rewrite is reported.
+- Optionally, send the same prompt to an allowlisted OpenAI or Anthropic model. Its reply is treated as exactly as untrusted as the mock's.
+- Tell the reviewer which values were defaulted because the request did not state them.
 - Parse that JSON and validate it against a strict schema. Invalid generator output is stored and returned; it is not rejected at the HTTP layer and it is not repaired.
 - Evaluate a fixed set of policies and a local synthetic price catalog.
 - Let a reviewer approve an evaluated plan or reject a draft or evaluated plan. Approval is bound to a canonical hash of the proposal. Rejection uses the plan id only and keeps the stored proposal, hash, and evaluation results.
@@ -27,7 +29,7 @@ Implementation then proceeds by prompting against this document, one slice at a 
 
 ### Out of scope
 
-- A real language-model client, paid APIs, or prompt repair.
+- A *required* language-model client, paid APIs as a dependency, or prompt repair. The optional model adapter is off by default and needs a key per request.
 - Cloud accounts, credentials, provider SDKs, and Terraform CLI (`init`, `plan`, `apply`).
 - Real `aws_*` or `azurerm_*` resources, Bicep, Kubernetes, or any path that creates infrastructure.
 - A database, authentication, multi-user sessions, queues, webhooks, or a deploy pipeline.
@@ -53,8 +55,10 @@ One FastAPI process and one Streamlit process. Streamlit is an HTTP client. Plan
 flowchart LR
   UI["Streamlit HTTP client"] --> API["FastAPI routes"]
   API --> Svc["services.py"]
-  Svc --> Planner["planner.py untrusted JSON"]
+  Svc --> Planner["planner.py or llm.py untrusted JSON"]
+  Planner --> Lexicon["lexicon.py lexicon.json"]
   Svc --> Det["validation policies pricing hashing"]
+  Svc --> Notes["reviewer notes and defaults"]
   Svc --> Art["artifacts.py"]
   Svc --> Store["InMemoryStore"]
 ```
@@ -71,17 +75,19 @@ Flat layout under `app/`, `ui/`, and `tests/`. No `src/` tree, no domain/infrast
 
 | Module | Responsibility | Must not |
 |---|---|---|
-| `planner.py` | Return a JSON string from vocabulary or a `SCENARIO:` fixture. | Validate, score policy, price, approve, render, or repair JSON. |
+| `planner.py` | Return a JSON string from vocabulary or a `SCENARIO:` fixture. Report its rewrites (`explain`) and what the request named (`stated_details`). | Validate, score policy, price, approve, render, or repair JSON. |
+| `lexicon.py` | Rewrite request text from `lexicon.json`: synonyms, quantity phrasing, one-edit typos toward distinctive words. Refuse unsupported resources and regions. | Correct silently, or correct toward a word with common English look-alikes. |
+| `llm.py` | One HTTP call to an allowlisted model: JSON-only, low effort, 32 KB reply cap. | Store or log the key; repair or validate the reply. |
 | `validation.py` | `json.loads`, then `ProposedPlan.model_validate`. | Change or default invalid fields. |
 | `policies.py` | Return policy results. | Mutate the plan. |
 | `pricing.py` | Sum the local catalog with `Decimal`. | Approve, render, or skip an unpriced line. |
 | `hashing.py` | Canonical SHA-256. | Change `plan_hash` except at evaluation. |
-| `services.py` | Own state transitions. | Call a cloud SDK or Terraform. |
+| `services.py` | Own state transitions. Record `interpretation_notes` and `defaults_applied` as reviewer hints. | Call a cloud SDK or Terraform; let a note block approval or enter the hash. |
 | `artifacts.py` | Render HCL after approval and a fresh hash check. | Render when status is not approved or the hash drifted. |
 | `store.py` | Get and put records. | Apply policy or pricing. |
 | `ui/app.py` | Present the plan, send the stored hash on approve, and reject with the plan id only. | Import `app.services`, `app.store`, `app.policies`, or any other domain module. |
 
-`Planner` is an optional five-line protocol: `generate(prompt: str) -> str`. The only implementation is `MockPlanner`.
+`Planner` is an optional five-line protocol: `generate(prompt: str) -> str`. The only implementation is `MockPlanner`. The model adapter in `llm.py` is called by the route, not through the protocol, and its string goes through the same service path.
 
 ### Technology
 
@@ -99,12 +105,12 @@ Flat layout under `app/`, `ui/`, and `tests/`. No `src/` tree, no domain/infrast
 
 `POST /v1/plans` with `{ "prompt": str }` creates the record and evaluates it when the schema allows.
 
-1. Streamlit sends the prompt.
-2. The mock planner returns a JSON string. For the example above: region `us-east-1`, environment `dev`, tags `environment`, `owner=dev-team`, `cost-center=engineering`, one `postgres` / `db-small`, and two `container` / `container-small`.
+1. Streamlit sends the prompt, which must be 30 to 2,000 characters unless it is a `SCENARIO:` token.
+2. The mock planner normalizes DevOps wording, then returns a JSON string. For the example above: region `us-east-1`, environment `dev`, tags `environment`, `owner=dev-team`, `cost-center=engineering`, one `postgres` / `db-small`, and two `container` / `container-small`.
 3. Validation parses and checks the schema.
 4. If the schema fails, the record stays `draft`, `proposed` is null, and policy, pricing, and hashing do not run.
-5. If the schema passes, policies and pricing run, then `plan_hash` is set once. Status becomes `evaluated` even when a policy or the price check fails.
-6. The UI shows the raw JSON, the validated plan, the policy table, and the synthetic cost.
+5. If the schema passes, policies and pricing run, then `plan_hash` is set once. Status becomes `evaluated` even when a policy or the price check fails. The service records `interpretation_notes` and `defaults_applied`.
+6. The UI shows a verdict banner, the defaults and readings, the raw JSON, the validated plan, the policy table, and the synthetic cost.
 7. Approve submits the `plan_hash` from that response. Reject submits the plan id only.
 8. Artifact generation runs only after approval and a second hash check. It stores the HCL on the record and sets `artifact_generated`. The artifact route returns that updated record. A rejected plan cannot generate an artifact. Generating again is refused; the stored HCL is read with `GET /v1/plans/{plan_id}`.
 
@@ -230,7 +236,9 @@ Base path `/v1`. JSON. No authentication.
 | `GET` | `/v1/schema/plan` | `ProposedPlan.model_json_schema()`. |
 | `GET` | `/health` | `{ "status": "ok", "service": "prompt-to-provisioning-planner" }`. |
 
-Plan routes return `PlanRecord`: `id`, `prompt`, `raw_output`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `artifact`, `created_at`, `updated_at`. `raw_output` is the untrusted generator string. `artifact` is null until generation and is included on the record after the artifact route succeeds. Later reads use the same record. Currency amounts are JSON strings from Pydantic, not floats. Blank prompts, extra request fields, non-string values, and invalid UUIDs use FastAPI's **422** `detail` body. Service errors contain only `code` and `message`, with no stack trace.
+`POST /v1/plans` also accepts optional `provider` (`mock`, `openai`, `claude`), `model`, and `api_key`. The prompt must be 30 to 2,000 characters after trimming; a `SCENARIO:` prompt is exempt from the minimum. `GET /v1/decisions`, `GET /v1/catalog/prices`, and `GET /v1/catalog/policy` are read-only.
+
+Plan routes return `PlanRecord`: `id`, `prompt`, `raw_output`, `generator`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `interpretation_notes`, `defaults_applied`, `artifact`, `created_at`, `updated_at`. `raw_output` is the untrusted generator string. `artifact` is null until generation and is included on the record after the artifact route succeeds. Later reads use the same record. Currency amounts are JSON strings from Pydantic, not floats. Blank prompts, extra request fields, non-string values, and invalid UUIDs use FastAPI's **422** `detail` body. Service errors contain only `code` and `message`, with no stack trace.
 
 Run one API worker. Route handlers are async and call the service synchronously, with no await during a transition. The store is not locked.
 
@@ -248,7 +256,14 @@ Deep copies stop accidental aliasing. They are not a lock and not a durability m
 
 Tests assert behavior: HTTP status, stored status, validation errors, policy rows, `Decimal` totals, hash mismatch, and rendered text. They do not assert private call order.
 
-Required cases include a valid generated plan, malformed JSON, missing fields, unexpected fields, an unsupported region, missing tags, public object storage, excessive quantity, excessive storage, an unknown SKU, totals `71.00` and `73.50`, a warning that does not block, errors that do, a wrong submitted hash, mutation after evaluation, mutation after approval and before render, a rejected plan that cannot render, two identical renders, and the health endpoint. A defect fix adds a test that reproduces the defect.
+Required cases include a valid generated plan, malformed JSON, missing fields, unexpected fields, an unsupported region, missing tags, public object storage, excessive quantity, excessive storage, an unknown SKU, totals `71.00` and `73.50`, a warning that does not block, errors that do, a wrong submitted hash, mutation after evaluation, mutation after approval and before render, a rejected plan that cannot render, two identical renders, and the health endpoint. Later slices added:
+- 51 realistic DevOps requests in `tests/planner_cases.json`, each with its expected plan or refusal
+- an English look-alike guard for typo correction
+- defaults call-outs
+- provider request shapes, with no network
+- the UI banners and prompt check
+
+A defect fix adds a test that reproduces the defect.
 
 ## Implementation sequence
 
@@ -261,6 +276,11 @@ Prompt one slice at a time, and include that slice’s tests in the same prompt:
 5. Jinja2 `main.tf.j2`, rendered only after the artifact hash check.
 6. Streamlit client.
 7. Docker Compose, Dockerfiles, and a README that matches this architecture.
+8. Hardening, added after the first build:
+   - planner parsing fixes and the DevOps lexicon
+   - model guardrails: JSON-only output, size limits, refusal handling, low effort
+   - reviewer notes and defaults
+   - clearer failure UI and the live prompt check
 
 ## Open decisions
 

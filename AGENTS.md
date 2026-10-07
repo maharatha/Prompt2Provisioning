@@ -119,7 +119,7 @@ Use `int` for `quantity` and `capacity_gb`. Do **not** use `float` for currency 
 
 Require `capacity_gb` when `type` is `object_storage`. Policies and pricing must use `quantity` (and storage `capacity_gb`), not `len(resources)`.
 
-**Resource types (only):** `container`, `postgres`, `object_storage`.
+**Resource types (only):** `container`, `postgres`, `mysql`, `object_storage`.
 
 Each resource, where applicable: `type`, `name`, `sku`, `quantity`, `capacity_gb`, `public_access`.
 
@@ -135,15 +135,23 @@ Each resource, where applicable: `type`, `name`, `sku`, `quantity`, `capacity_gb
 
 ## Mock planner
 
-Default planner is deterministic. It understands a small vocabulary:
+Default planner is deterministic. It understands a small core vocabulary:
 
-- postgres / database
+- postgres / database, mysql
 - container, web container, web application
 - object storage
 - dev, test, prod
 - US East → `us-east-1`; US West → `us-west-2`; Azure East US → `eastus2`
-- small, medium, low cost
-- quantities one, two, three
+- small, medium, large, low cost
+- quantities one through ten, or a number
+
+Before parsing, `lexicon.py` rewrites DevOps wording using `app/data/lexicon.json`. Rules for that pass:
+- **Synonyms:** `rds`, `pods`, `uat`, `iad`, and similar become planner words.
+- **Quantity phrasing:** `api x3` and `3 replicas` become a count in front of the resource.
+- **Typos:** only one-edit typos of the distinctive words listed in `planner.py` are corrected. Two-edit misspellings of resource nouns are refused with a suggestion.
+- **Unsupported resources and regions** are refused, never dropped.
+- **Every rewrite is returned by `MockPlanner.explain`** and shown to the reviewer.
+- **New words:** add a case to `tests/planner_cases.json` whenever the lexicon changes. Never add a typo target that has a common English word one edit away; `tests/test_lexicon.py` pins the known look-alikes.
 
 If the prompt contains `SCENARIO:<name>`, skip vocabulary parsing and return a **fixed invalid or edge-case JSON string**. Never repair scenario payloads.
 
@@ -288,7 +296,15 @@ Plan routes return `PlanRecord`: `id`, `prompt`, `raw_output`, `generator`, `sta
 
 ## Streamlit
 
-- Prompt text area, submit, display raw JSON, validated plan, policy table, synthetic cost.
+- Prompt text area, submit, display raw JSON (formatted view plus exact stored text), validated plan, policy table, synthetic cost.
+- Generate plan is a primary button. It is enabled only for 30+ characters or a selected scenario, and the count updates live as the person types. The server never disables the button itself; `_on_generate` and the API both refuse short prompts.
+- Show a centred busy overlay while a plan is generated.
+- Make outcomes unmistakable:
+  - a colour-coded verdict banner (red for not valid or blocked, amber for warnings, green for ready)
+  - a failed step in the stepper
+  - a defaults box for `defaults_applied`
+  - planner readings for `interpretation_notes`
+- Escape every model-sourced string before rendering it as HTML.
 - Approve sends the **stored** `plan_hash` from the last GET/POST response. Reject sends the plan id only.
 - Disable approve when the record has validation errors, a policy `error`, or pricing that did not succeed.
 - Generate artifact and download `main.tf` only after approval. The file body is the plan record's `artifact` field.
