@@ -25,17 +25,22 @@ Do not require: a real LLM (an optional adapter is allowed; see Architecture), p
 
 Packaging: `requirements.txt` at the repo root. Do not introduce a `src/` layout, Alembic, or a multi-package workspace.
 
-Approved dependencies (add others only with clear value): `fastapi`, `uvicorn`, `pydantic>=2`, `jinja2`, `streamlit`, `httpx`, `pytest`.
+Approved dependencies (add others only with clear value): `fastapi`, `uvicorn`, `pydantic>=2`, `jinja2`, `streamlit`, `requests` (UI), `httpx` (API model call and OAuth), `pytest`.
+
+`requirements.txt` must list every package that `app/` or `ui/` imports, because the Docker images install only that file. Test-only packages go in `requirements-dev.txt`. `tests/test_requirements.py` enforces this.
 
 ## Repository layout
 
 ```
 README.md
+ARCHITECTURE.md
 AGENTS.md
 requirements.txt
+requirements-dev.txt
 docker-compose.yml
 Dockerfile.api
 Dockerfile.ui
+docs/button-flow.html  # button diagram, also shown in the UI
 app/
   main.py              # FastAPI app and thin route handlers
   models.py            # Pydantic models and enums
@@ -52,16 +57,30 @@ app/
   services.py          # create / evaluate / approve / reject / artifact
   templates/main.tf.j2
   data/prices.json
+  data/policy.json     # policy thresholds and allow-lists (data, not rules)
+  data/lexicon.json    # DevOps vocabulary for lexicon.py
 ui/
   app.py               # Streamlit; HTTP only
 tests/
+  planner_cases.json   # realistic requests and the plan or refusal each must produce
   test_planner.py
+  test_lexicon.py
+  test_models.py
   test_validation.py
   test_policies.py
   test_pricing.py
+  test_hashing.py
+  test_store.py
+  test_services.py
   test_approval.py
   test_artifacts.py
+  test_artifact_generation.py
+  test_llm.py
+  test_chatgpt_auth.py
   test_api.py
+  test_health.py
+  test_requirements.py
+  test_ui.py
 ```
 
 Do not add `core/domain/infrastructure` folders, repository interfaces, or a second service process.
@@ -82,6 +101,7 @@ Do not add `core/domain/infrastructure` folders, repository interfaces, or a sec
   - Tests use `httpx.MockTransport`. No test calls a real provider.
 - Optional ChatGPT sign-in (`chatgpt_auth.py`), for OpenAI only. Rules:
   - It uses OpenAI's open-source "Sign in with ChatGPT" flow: OAuth 2.0 + PKCE, a `http://127.0.0.1:{OPENAI_CALLBACK_PORT}/callback` loopback served by the API, and no client secret. Compare `state` with `hmac.compare_digest`; a state works once and expires after 10 minutes.
+  - The OAuth `code` and `state` never reach a log. The uvicorn access log writes the callback as `/callback?[redacted]`.
   - Access and refresh tokens live only in API process memory. Never put them on a record, log them, return them from a route, or write them to disk. A restart means signing in again.
   - A typed API key wins. A blank OpenAI key falls back to the sign-in. The generator label becomes `openai-chatgpt:<model>`.
   - The plan route is the Responses API with `stream: true`, `store: false`, and `text.format` JSON mode. The allowlist is the account's own `/v1/models` list. The 32 KB limit, the refusal and cut-off rules, and the "never repair" rule all apply. A reply counts only after `response.completed`.
@@ -138,7 +158,7 @@ Each resource, where applicable: `type`, `name`, `sku`, `quantity`, `capacity_gb
 
 **Enums:**
 
-- `ResourceType`: `container` | `postgres` | `object_storage`
+- `ResourceType`: `container` | `postgres` | `mysql` | `object_storage`
 - `PlanStatus`: `draft` | `evaluated` | `approved` | `rejected` | `artifact_generated`
 - Policy result `status`: `passed` | `warning` | `error`
 
@@ -196,16 +216,16 @@ Each result includes:
 
 If a policy has no findings, emit one `passed` row for that `policy_id`.
 
-Implement **only** these policies:
+Implement **only** these policies. Thresholds and allow-lists live in `app/data/policy.json`; the functions decide what the values mean. Do not turn that file into a rule language.
 
 | policy_id | Rule | status on violation |
 |---|---|---|
-| `allowed_regions` | Region in `{us-east-1, us-west-2, eastus2}` | `error` |
-| `required_tags` | Tags `environment`, `owner`, `cost-center` present and non-blank | `error` (per missing key) |
-| `resource_limits` | Sum of container quantity ≤ 5; postgres quantity ≤ 2; object storage `capacity_gb` ≤ 500 | `error` |
-| `dev_sku_tier` | If `environment==dev`, SKUs must be `*-small` or `*-medium` | `error` for `*-large` or other tiers |
+| `allowed_regions` | Region in `allowed_regions` (`us-east-1`, `us-west-2`, `eastus2`) | `error` |
+| `required_tags` | Tags `environment`, `owner`, `cost-center` present and non-blank | `error` (per missing or blank key) |
+| `resource_limits` | Sum of container quantity ≤ 5; postgres quantity ≤ 2; mysql quantity ≤ 2; object storage `capacity_gb × quantity`, summed, ≤ 500 | `error` |
+| `dev_sku_tier` | If `environment==dev`, each SKU is in `dev_allowed_skus` for its type (currently small, medium, and large) | `error` for any other SKU |
 | `storage_public` | `object_storage` with `public_access=true` | `error` |
-| `dev_medium_cost` | If `environment==dev` and any `*-medium` SKU | `warning` (does not block) |
+| `dev_medium_cost` | If `environment==dev` and a SKU is in `dev_warning_skus` (currently medium and large) | `warning` (does not block) |
 
 Unknown **type** is a schema failure (`ResourceType` enum), not a policy. Unknown **SKU** is a **pricing** fail-closed error. Do not add a `known_sku` policy.
 
@@ -216,16 +236,15 @@ Error-level results block approval. Warnings do not. Mixed AWS-style and Azure-s
 - Use `Decimal` for every unit price, line total, and monthly total.
 - Construct `Decimal` values from **strings**, never from floats.
 - Load prices from `app/data/prices.json` (synthetic only). Label all costs as **synthetic estimates**.
-- Format monetary values to two decimal places.
+- The API returns money as unquantized JSON strings (`"71"`). The UI formats it to two decimal places.
 - Price by `quantity` (and GB for storage). Never omit an unpriced resource and return a partial success.
 - Unknown or missing type/SKU in the catalog: pricing error and **block approval**.
 
 Synthetic catalog:
 
-- `container-small`: `"18"` per instance
-- `container-medium`: `"42"` per instance
-- `db-small`: `"35"` per instance
-- `db-medium`: `"95"` per instance
+- `container-small` `"18"`, `container-medium` `"42"`, `container-large` `"96"` per instance
+- `db-small` `"35"`, `db-medium` `"95"`, `db-large` `"240"` per instance
+- `mysql-small` `"49"`, `mysql-medium` `"140"`, `mysql-large` `"320"` per instance
 - `storage-standard`: `"0.025"` per GB
 
 Happy-path cost: `2 * 18 + 35 = 71.00`. With 100 GB storage-standard: `73.50`.
@@ -267,7 +286,9 @@ Approval succeeds only when **all** of:
 3. `current_hash == record.plan_hash`
 4. `validation_errors` is empty
 5. no policy result has `status=error`
-6. pricing succeeded (`cost` present, no pricing error, monthly total present)
+6. pricing succeeded (`cost` present, `succeeded` true, no pricing error, monthly total present)
+
+The submitted hash must be 64 lowercase hex characters; any other shape is a 409 naming the problem.
 
 On approval, compute `current_hash = canonical_hash(record.proposed)` and **do not write it back**. Comparing only the client hash to the stored hash is **insufficient**. A mutated `proposed` with a stale stored hash must fail because `current_hash != record.plan_hash`.
 
@@ -298,6 +319,9 @@ Base path `/v1`. JSON only. No authentication. Run one API worker. Handlers call
 | `POST` | `/v1/plans/{plan_id}/approve` | `{ "plan_hash": str }`. **200** updated `PlanRecord`. **409** `{ "code", "message" }` names the failed gate. The service checks hash format. |
 | `POST` | `/v1/plans/{plan_id}/reject` | No body. The plan id is the only input. `draft` or `evaluated` → `rejected`, preserving the proposal, hash, and evaluation results. **200** updated `PlanRecord`. **409** for `approved`, `rejected`, or `artifact_generated`. |
 | `POST` | `/v1/plans/{plan_id}/artifact` | No body. Approved plan whose current hash still matches → updated `PlanRecord` with the HCL in `artifact`. **409** when refused, including a rejected plan or a repeated generation. |
+| `GET` | `/v1/decisions` | Approved, rejected, and artifact plans, newest first. Read-only. |
+| `GET` | `/v1/catalog/prices` | `prices.json`, rates as strings. Read-only. |
+| `GET` | `/v1/catalog/policy` | `policy.json`. Read-only. |
 | `GET` | `/v1/schema/plan` | `ProposedPlan.model_json_schema()`. |
 | `GET` | `/v1/openai/sign-in` | `{ "authorize_url" }` for "Sign in with ChatGPT". |
 | `GET` | `/callback` | OAuth loopback target. Plain escaped HTML page; **400** when the state, code, or exchange fails. |

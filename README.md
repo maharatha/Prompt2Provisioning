@@ -23,7 +23,7 @@ Each plan lives in a Python dictionary inside the running API process. Stop or r
 | Prompt, proposal, decision, and dry-run file | API process memory only. Lost on restart. |
 | OpenAI or Anthropic API key | Sent with that one generate request. Not written to the plan, the logs, or disk. |
 | "Sign in with ChatGPT" access and refresh tokens | API process memory only, until sign-out, a rejected token, or restart. Never returned to the UI, written to the plan, logged, or saved to disk. |
-| Log lines | API process stderr. They name the plan id, status, and outcome, and omit the prompt and the key. |
+| Log lines | API process stderr. They name the plan id, status, and outcome, and omit the prompt and the key. The access log shows the sign-in callback as `/callback?[redacted]`, so the OAuth code and state are not written. |
 | `app/data/prices.json`, `app/data/policy.json`, `app/data/lexicon.json` | Rate table, allow-lists, and planner vocabulary that ship with the repository. Not a request history. |
 | Downloaded `main.tf` | A file on your computer. The application does not upload or run it. |
 
@@ -118,6 +118,7 @@ Stop either process with Ctrl+C in its terminal.
 | Variable | Where | Meaning |
 |---|---|---|
 | `API_BASE_URL` | UI process | API origin. Unset locally means `http://localhost:8000`. Compose sets `http://api:8000`. |
+| `OPENAI_CALLBACK_PORT` | API process | Port in the `http://127.0.0.1:{port}/callback` address that "Sign in with ChatGPT" redirects to. Default `8000`. Set it only when the API is published on another host port. |
 
 ### Docker Compose
 
@@ -520,7 +521,7 @@ Create body:
 
 For `openai` or `claude`, `model` must be one of the allowlisted ids and `api_key` must be non-blank. The exception is `openai` with a blank key while a ChatGPT sign-in is active: then `model` must be one of that plan's models (see [Sign in with ChatGPT](#sign-in-with-chatgpt)). The UI sends `gpt-5` or `claude-sonnet-5-5`. A provider failure is **422** `{ "code": "provider_error", "message" }` and is not stored. An unknown `SCENARIO:` name on the built-in planner is **422** `{ "code": "unknown_scenario", "message" }` and is not stored.
 
-`PlanRecord` fields: `id`, `prompt`, `raw_output`, `generator`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `interpretation_notes`, `artifact`, `created_at`, `updated_at`. `generator` is `mock`, `openai:<model>`, `openai-chatgpt:<model>` (ChatGPT plan), or `claude:<model>`. `interpretation_notes` lists the built-in planner's rewrites, or, for a model plan, its differences from the built-in reading (see [Guardrails on model output](#guardrails-on-model-output)). `defaults_applied` lists every value the request did not state, for any planner. Examples: *"Region: the request names none, so the plan uses us-east-1."*, *"Size: none given for web (container), so it uses container-small, the smallest tier."*, and owner or cost-center tags the request did not name. When a request names an owner, the built-in planner says it did not read it. Both lists are empty for drafts and `SCENARIO:` fixtures. Neither is policy, an approval gate, or part of the hash. The Work page shows defaults in a blue **Defaults the plan used** box, and the review banner gives their count. `artifact` is null until generation. `raw_output` is the untrusted generator string so the UI can show it.
+`PlanRecord` fields: `id`, `prompt`, `raw_output`, `generator`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `interpretation_notes`, `defaults_applied`, `artifact`, `created_at`, `updated_at`. `generator` is `mock`, `openai:<model>`, `openai-chatgpt:<model>` (ChatGPT plan), or `claude:<model>`. `interpretation_notes` lists the built-in planner's rewrites, or, for a model plan, its differences from the built-in reading (see [Guardrails on model output](#guardrails-on-model-output)). `defaults_applied` lists every value the request did not state, for any planner. Examples: *"Region: the request names none, so the plan uses us-east-1."*, *"Size: none given for web (container), so it uses container-small, the smallest tier."*, and owner or cost-center tags the request did not name. When a request names an owner, the built-in planner says it did not read it. Both lists are empty for drafts and `SCENARIO:` fixtures. Neither is policy, an approval gate, or part of the hash. The Work page shows defaults in a blue **Defaults the plan used** box, and the review banner gives their count. `artifact` is null until generation. `raw_output` is the untrusted generator string so the UI can show it.
 
 Service errors are `{ "code", "message" }` only. Responses do not include stack traces. Common **409** codes: `status`, `submitted_hash`, `current_hash`, `validation_errors`, `policy_error`, `pricing`, `missing_proposal`, `missing_plan_hash`.
 
@@ -664,6 +665,7 @@ How it works (`app/chatgpt_auth.py`): OAuth 2.0 with PKCE (S256) and the self-se
 - `state` is random, works once, and expires after 10 minutes.
 - The code is exchanged for a one-hour access token and a refresh token, both kept in API memory only.
 - The access token is refreshed a minute before it expires. If refresh fails, or OpenAI returns 401, the sign-in is forgotten.
+- The uvicorn access log writes the callback as `/callback?[redacted]`. A refused callback is logged with its fixed reason text, which never contains the code, state, or a token.
 - The ID token is not used to identify anyone, so its signature is not checked (that would need a JWT library). `state` and PKCE protect the exchange.
 
 The model call (`app/llm.py`) uses the Responses API, as the plan route requires:
@@ -765,7 +767,7 @@ From the repository root, with the virtual environment active:
 python -m pytest
 ```
 
-Tests use FastAPI `TestClient` and inject an empty `InMemoryStore` through `dependency_overrides`. They assert HTTP status, stored status, validation errors, policy rows, decimal totals, hash mismatch, and rendered text. They do not require Docker, a model key, or a network. Provider and OAuth calls use `httpx.MockTransport`. The suite has 694 tests.
+Tests use FastAPI `TestClient` and inject an empty `InMemoryStore` through `dependency_overrides`. They assert HTTP status, stored status, validation errors, policy rows, decimal totals, hash mismatch, and rendered text. They do not require Docker, a model key, or a network. Provider and OAuth calls use `httpx.MockTransport`. The suite has 696 tests.
 
 What pytest cannot cover:
 - **The in-page live prompt script and the busy overlay** are JavaScript and CSS, which pytest cannot run. They were checked in a real browser (Edge driven by Playwright) during development. Their HTML and script are pinned by unit tests.
@@ -810,4 +812,4 @@ Representative prompts from that pass, lightly edited:
 - *"If someone doesn't specify region or environment, explicitly show that we used the defaults."* This led to `defaults_applied`.
 - *"Have you done something with the UI which is adding false delay?"* Measuring showed the UI and API add under 0.25 s. The real cause was a larger model token budget, so the fix was low reasoning effort plus per-call timing logs.
 
-Where the running code has moved past the original note, this README and the modules above are the source of truth. That covers MySQL, large SKUs, `policy.json`, the decision log, the catalog routes, the optional model call, the DevOps lexicon, the reviewer notes, and the prompt limits.
+Where the running code has moved past the original note, this README and the modules above are the source of truth. That covers MySQL, large SKUs, `policy.json`, the decision log, the catalog routes, the optional model call, the "Sign in with ChatGPT" credential, the DevOps lexicon, the reviewer notes, and the prompt limits. ARCHITECTURE.md has been brought up to date with all of these.
