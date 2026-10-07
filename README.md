@@ -94,7 +94,7 @@ Run the API:
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Use one worker. Do not pass `--workers` greater than 1. The in-memory store lives in that process. Stop the API or the UI with Ctrl+C in its terminal. Stopping or restarting the API process drops every plan. The UI must not reuse a plan id from before that restart.
+Use one worker. Do not pass `--workers` greater than 1. The in-memory store lives in that process.
 
 Then open `http://127.0.0.1:8000/health`.
 
@@ -105,6 +105,8 @@ python -m streamlit run ui/app.py
 ```
 
 The UI reads `API_BASE_URL`. When that variable is unset, it uses `http://localhost:8000`.
+
+Stop the API or the UI with Ctrl+C in its terminal. Stopping or restarting the API process drops every plan. The UI must not reuse a plan id from before that restart.
 
 Run tests:
 
