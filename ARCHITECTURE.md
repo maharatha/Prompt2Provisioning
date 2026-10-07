@@ -130,11 +130,13 @@ A policy error or a pricing failure does not push the record back to `draft`. Th
 
 ## Approval and integrity
 
-`canonical_hash(proposed)`:
+`canonical_json` and `canonical_hash` accept a validated `ProposedPlan` and do not mutate it. They do not read the store or refresh a stored hash.
 
-1. `proposed.model_dump(mode="json", exclude_none=True)`
-2. `json.dumps(..., sort_keys=True, separators=(",", ":"))`
-3. SHA-256 hex digest
+Serialization uses the proposal only:
+
+1. `proposed.model_dump(mode="json")` includes every proposed-plan field: region, environment, tags, and each resource’s type, name, SKU, quantity, `capacity_gb`, and `public_access`. `capacity_gb` is JSON `null` when the resource has no capacity. Record id, status, timestamps, raw planner text, policies, and cost are not included.
+2. `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)` sorts dictionary keys and leaves resource list order unchanged. The plan is not otherwise reordered or normalized. Unicode is encoded as UTF-8, not as `\u` escapes.
+3. `canonical_hash` is the lowercase SHA-256 hexadecimal digest of those UTF-8 bytes.
 
 Evaluation writes `plan_hash` once. Approve, reject, and artifact generation recompute `current_hash` and do not store it. Writing the recomputed value back would accept a plan that changed after evaluation.
 

@@ -205,9 +205,9 @@ Happy-path cost: `2 * 18 + 35 = 71.00`. With 100 GB storage-standard: `73.50`.
 
 `canonical_hash(proposed)`:
 
-1. `proposed.model_dump(mode="json", exclude_none=True)`
-2. `json.dumps(..., sort_keys=True, separators=(",", ":"))`
-3. SHA-256 hex digest
+1. `proposed.model_dump(mode="json")` — every proposed-plan field, including nested resources, tags, `public_access`, and `capacity_gb` (`null` when absent). No record id, status, timestamps, raw planner text, policies, or cost.
+2. `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)` — sort object keys only; keep resource list order.
+3. Lowercase SHA-256 hex digest of the UTF-8 bytes.
 
 Set `record.plan_hash = canonical_hash(proposed)` **once** at evaluation. Never overwrite it on approve, reject, or artifact generation.
 
