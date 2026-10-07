@@ -1,15 +1,17 @@
-"""Create, evaluate, retrieve, approve, and reject deployment plans.
+"""Create, evaluate, retrieve, approve, reject, and render deployment plans.
 
 The planner returns one raw string. This module stores that string unchanged,
 validates it, and, when the schema accepts it, runs policy, pricing, and the
-canonical hash. Approval and rejection change status only. They do not
-re-evaluate a stored plan, repair it, or replace ``plan_hash``. This module
-does not render artifacts.
+canonical hash. Approval, rejection, and artifact generation change status
+only. They do not re-evaluate a stored plan, repair it, or replace
+``plan_hash``. Rendering runs only for an approved plan, and the artifact is
+stored only after rendering succeeds.
 """
 
 import hmac
 from uuid import UUID
 
+from app.artifacts import render_artifact
 from app.hashing import canonical_hash
 from app.models import CheckStatus, PlanRecord, PlanStatus, ProposedPlan
 from app.planner import MockPlanner, Planner
@@ -122,6 +124,36 @@ class PlanService:
         rejected = record.model_copy(update={"status": PlanStatus.REJECTED})
         return self._store.update(rejected)
 
+    def generate_artifact(self, plan_id: UUID) -> PlanRecord:
+        """Render and store HCL for an approved plan.
+
+        The evaluated hash is recomputed and compared, then left unchanged.
+        The proposal is not modified. A failing gate or a renderer error
+        leaves the stored record unchanged. A plan that already has an
+        artifact is refused; retrieve it with ``get_plan``.
+        """
+        record = self._require_record(plan_id)
+        self._require_approved(record)
+        stored_hash = self._require_proposal_and_hash(record)
+        self._require_current_hash(record, stored_hash)
+        self._require_no_validation_errors(record)
+        self._require_no_policy_errors(record)
+        self._require_successful_pricing(record)
+        proposed = record.proposed
+        if not isinstance(proposed, ProposedPlan):
+            raise InvalidPlanOperation(
+                "missing_proposal",
+                "The stored plan has no proposal.",
+            )
+        rendered = _render_artifact(proposed)
+        generated = record.model_copy(
+            update={
+                "status": PlanStatus.ARTIFACT_GENERATED,
+                "artifact": rendered,
+            }
+        )
+        return self._store.update(generated)
+
     def _require_record(self, plan_id: UUID) -> PlanRecord:
         record = self._store.get(plan_id)
         if record is None:
@@ -134,6 +166,16 @@ class PlanService:
                 "status",
                 (
                     "Approval requires status 'evaluated'; "
+                    f"the plan is '{record.status.value}'."
+                ),
+            )
+
+    def _require_approved(self, record: PlanRecord) -> None:
+        if record.status is not PlanStatus.APPROVED:
+            raise InvalidPlanOperation(
+                "status",
+                (
+                    "Artifact generation requires status 'approved'; "
                     f"the plan is '{record.status.value}'."
                 ),
             )
@@ -233,6 +275,21 @@ def _submitted_hash_problem(submitted: object) -> str | None:
     if len(submitted) != _HASH_LENGTH or any(char not in _HASH_ALPHABET for char in submitted):
         return "malformed_submitted_hash"
     return None
+
+
+def _render_artifact(proposed: ProposedPlan) -> str:
+    """Render one proposal, mapping a renderer failure to a service error.
+
+    The ``except`` covers only ``render_artifact``. Gate failures in
+    ``generate_artifact`` are raised before this call and are not caught here.
+    """
+    try:
+        return render_artifact(proposed)
+    except Exception as exc:
+        raise InvalidPlanOperation(
+            "artifact_render",
+            "The approved plan could not be rendered.",
+        ) from exc
 
 
 def _hashes_equal(left: str, right: str) -> bool:
