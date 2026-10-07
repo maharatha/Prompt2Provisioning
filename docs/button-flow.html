@@ -47,8 +47,21 @@
 
     header p {
       margin: 0;
-      max-width: 68ch;
+      max-width: 72ch;
       color: var(--muted);
+    }
+
+    .notice {
+      margin-top: 16px;
+      max-width: 72ch;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: var(--card);
+    }
+
+    .notice strong {
+      color: var(--ink);
     }
 
     .controls {
@@ -308,8 +321,15 @@
     <p>
       This is the Streamlit screen, drawn as the path a click actually takes.
       The planner is the only untrusted step. Everything after that JSON string
-      is ordinary Python. Nothing on this page calls the API or deploys infrastructure.
+      is ordinary Python.
     </p>
+    <div class="notice">
+      <strong>Prototype.</strong>
+      There is no database. Prompts, plans, decisions, and API keys are not written to disk.
+      A plan exists only in the API process memory and is gone when that process stops.
+      This page does not call the API, does not send a key, and does not deploy anything.
+      The same person writes the sentence and approves or rejects it.
+    </div>
   </header>
 
   <div class="controls" role="toolbar" aria-label="UI buttons">
@@ -377,7 +397,7 @@
         <article class="node" data-node="store" style="--area: store">
           <span class="order"></span>
           <h2>In-memory store</h2>
-          <p data-sub>one process dict</p>
+          <p data-sub>no database · lost on restart</p>
         </article>
         <article class="node" data-node="artifact" style="--area: artifact">
           <span class="order"></span>
@@ -431,7 +451,7 @@
       policies: "report only",
       pricing: "synthetic Decimal",
       hash: "SHA-256, written once",
-      store: "one process dict",
+      store: "no database · lost on restart",
       artifact: "demo_* · Terraform not run",
     };
 
@@ -450,7 +470,7 @@
           ["policies", "Six checks, none of them edits", "Allowed region, required tags, quantity limits, dev SKU tier, public storage, and the dev medium-cost warning. This prompt passes all six. A warning would not block approval. An error would."],
           ["pricing", "Synthetic monthly total 71", "Decimal values come from app/data/prices.json. Two container-small instances at 18, plus one db-small at 35, is 71. An unknown SKU fails the estimate and blocks approval. No cloud price API is called."],
           ["hash", "The proposal is fingerprinted once", "plan_hash is the SHA-256 of the proposal only: region, environment, tags, and resources. Status, cost, and policy results are not inside it. Later clicks do not overwrite this value."],
-          ["store", "Saved as evaluated", "The record lives in a dict in this API process. A restart drops it. Approve is enabled because validation is clean, no policy is an error, and pricing succeeded."],
+          ["store", "Held in memory only", "The record lives in a dict in this API process. There is no database, and the prompt is not written to disk. A restart drops every plan. The API key is never placed on the record. Approve is enabled because validation is clean, no policy is an error, and pricing succeeded."],
         ],
       },
       approve: {
@@ -490,7 +510,7 @@
           ["service", "Approved, and still the same plan", "Status must be approved. The service also re-reads the stored validation, policy, and pricing results. A plan that is already artifact_generated is refused. Read the saved HCL with Refresh instead."],
           ["hash", "The same freshness check", "The hash is computed again from the stored proposal and compared with plan_hash. It is not saved. Drift returns 409 and does not render."],
           ["artifact", "Dry-run HCL, then stop", "Jinja2 renders fictional demo_* resources and a comment that nothing was deployed. Resource names are not aws_* or azurerm_*. Terraform is not executed."],
-          ["store", "The file body is stored", "Status becomes artifact_generated. The HCL is the record's artifact field. Download main.tf uses that string and does not call this route again."],
+          ["store", "The file body stays in memory", "Status becomes artifact_generated. The HCL is the record's artifact field, still in the process dictionary. There is no database. Download main.tf uses that string and does not call this route again. Restarting the API drops the file with the plan."],
         ],
       },
       refresh: {

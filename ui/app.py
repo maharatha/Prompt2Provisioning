@@ -951,14 +951,14 @@ def _render_decision(record: object) -> None:
     st.subheader("3 Decision")
     with st.container(border=True):
         st.caption(
-            "The person who writes the request is not the person who accepts it. "
+            "The same person writes the sentence and decides. "
             "If the wording is wrong, change the request and generate again. "
             "That creates a new plan. It leaves this one unchanged."
         )
         st.caption(
-            "Reject is the reviewer's record that this exact plan must not proceed. "
+            "Reject records that this exact plan must not proceed. "
             "The price, policies, and hash stay stored, and the plan cannot be approved later. "
-            "Approve is the reviewer's record that this hash was accepted."
+            "Approve records that this hash was accepted."
         )
         reason = _approval_block_reason(record)
         if can_approve(record):
@@ -1318,9 +1318,20 @@ def _render_readme() -> None:
     st.title("Read me")
     st.markdown(
         """
-This prototype turns a plain-language infrastructure request into a plan a
-person can review. It does not connect to a cloud account, and it does not
-deploy anything.
+This is a local prototype. It turns a plain-language infrastructure request
+into a plan one person can review. It does not connect to a cloud account, and
+it does not deploy anything.
+
+### What is kept
+
+There is no database. The prompt, the plan, the decision, and the dry-run file
+live in a dictionary inside the API process. Restarting the API deletes them.
+An OpenAI or Anthropic key is sent with that one request and is not written to
+the plan, the logs, or disk. Log lines name the plan id and the outcome. They
+omit the sentence and the key, and they end when the API process ends.
+`prices.json` and `policy.json` ship with the repository. They are the rate
+table and the allow-lists, not a history of requests. The downloaded `main.tf`
+stays on your computer. Terraform is not run.
 
 ### What happens to a request
 
@@ -1328,7 +1339,7 @@ deploy anything.
 2. The built-in planner returns one JSON string from a phrase list. OpenAI (`gpt-5`) or Anthropic (`claude-sonnet-5-5`) can interpret the sentence instead. The API key is sent with that request and is not stored. The returned string is untrusted. The planner does not validate it, price it, or repair it.
 3. The API parses the JSON against a strict schema. Invalid JSON is stored as a draft and still returned. Missing fields are not filled in.
 4. A valid plan is checked by six policies and priced from a local synthetic catalog. The proposal is then hashed. The hash is written once.
-5. A reviewer approves or rejects. The author changes the request to make a new plan; Reject records that this plan must not proceed. Approve resubmits the stored hash, and the API recomputes the hash to confirm the proposal has not changed. Reject sends only the plan id. Approved and rejected plans stay in the decision log.
+5. The same person approves or rejects. Changing the request makes a new plan. Reject records that this plan must not proceed. Approve resubmits the stored hash, and the API recomputes the hash to confirm the proposal has not changed. Reject sends only the plan id. Approved and rejected plans stay in the decision log.
 6. After approval, the API can render a dry-run Terraform-style file. The resources are fictional `demo_*` blocks. Terraform is not executed.
 
 ### Architecture

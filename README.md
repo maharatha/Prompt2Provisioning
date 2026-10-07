@@ -1,8 +1,23 @@
 # Prompt-to-Provisioning Planner
 
-A local prototype that turns a plain-language infrastructure request into a reviewable deployment plan. A planner proposes JSON. Application code validates that JSON, applies policy, prices it from a local catalog, and stores the result. Approval is bound to a canonical hash of the proposal. An approved plan can be rendered as a dry-run Terraform-style document.
+A local prototype that turns a plain-language infrastructure request into a reviewable deployment plan. A planner proposes JSON. Application code validates that JSON, applies policy, and prices it from a local catalog. Approval is bound to a canonical hash of the proposal. An approved plan can be rendered as a dry-run Terraform-style document.
 
-**This prototype stays inside synthetic data.** It does not open a cloud account, read cloud credentials, or deploy infrastructure. The generated file is a fictional `main.tf`. Terraform is never executed.
+**This is a prototype.** It does not open a cloud account, read cloud credentials, or deploy infrastructure. The generated file is a fictional `main.tf`. Terraform is never executed. There is no database. Prompts, plans, decisions, and API keys are not kept after the API process stops.
+
+## What is kept
+
+Nothing you type is written to a database or to a file of plans.
+
+While the API process is running, each plan sits in a Python dictionary in that process. That is why the page can show the proposal, the decision, and the dry-run file. Stop or restart the API and that dictionary is gone. Plan ids from before the restart no longer exist. Refresh then returns **404**.
+
+| Item | Where it goes |
+|---|---|
+| Prompt, proposal, decision, and dry-run file | API process memory only. Lost on restart. |
+| OpenAI or Anthropic API key | Sent with that one generate request. Not written to the plan, the logs, or disk. |
+| Log lines | Printed to the API process stderr. They name the plan id and the outcome. They omit the sentence and the key. They end when that process ends. |
+| `app/data/prices.json` and `app/data/policy.json` | Files that ship with this repository. They are the rate table and the allow-lists, not a history of requests. |
+
+The same person writes the sentence and approves or rejects it. There is no login and no second account. The downloaded `main.tf` is a file on your computer. The application does not upload it and does not run Terraform.
 
 | | |
 |---|---|
@@ -17,32 +32,33 @@ Deeper contracts live in [ARCHITECTURE.md](ARCHITECTURE.md). This README is the 
 
 ## Contents
 
-1. [What a reviewer sees](#what-a-reviewer-sees)
-2. [Start the application](#start-the-application)
-3. [Architecture](#architecture)
-4. [Request lifecycle](#request-lifecycle)
-5. [Schema](#schema)
-6. [Policies](#policies)
-7. [Synthetic pricing](#synthetic-pricing)
-8. [Hash-bound approval](#hash-bound-approval)
-9. [Dry-run artifacts](#dry-run-artifacts)
-10. [HTTP API](#http-api)
-11. [Streamlit client](#streamlit-client)
-12. [Planners](#planners)
-13. [Repository layout](#repository-layout)
-14. [Tests](#tests)
-15. [Design boundaries](#design-boundaries)
+1. [What is kept](#what-is-kept)
+2. [What a reviewer sees](#what-a-reviewer-sees)
+3. [Start the application](#start-the-application)
+4. [Architecture](#architecture)
+5. [Request lifecycle](#request-lifecycle)
+6. [Schema](#schema)
+7. [Policies](#policies)
+8. [Synthetic pricing](#synthetic-pricing)
+9. [Hash-bound approval](#hash-bound-approval)
+10. [Dry-run artifacts](#dry-run-artifacts)
+11. [HTTP API](#http-api)
+12. [Streamlit client](#streamlit-client)
+13. [Planners](#planners)
+14. [Repository layout](#repository-layout)
+15. [Tests](#tests)
+16. [Design boundaries](#design-boundaries)
 
 ## What a reviewer sees
 
-The person who writes the sentence and the person who approves the plan are different roles.
+One person does both steps. There is no login and no second account. The same screen writes the sentence and approves or rejects the plan.
 
-1. The author describes a workload, for example: *A small PostgreSQL database and two web containers for a development team in US East, optimized for low cost.*
+1. You describe a workload, for example: *A small PostgreSQL database and two web containers for a development team in US East, optimized for low cost.*
 2. The app shows the untrusted planner JSON, the validated resources, the policy table, and a synthetic monthly price. That example evaluates to **USD 71.00**.
-3. The reviewer approves or rejects that exact plan. Approve sends the stored `plan_hash`. Reject sends the plan id only.
-4. After approval, the reviewer can generate and download `main.tf`. The file states that nothing was deployed.
+3. You approve or reject that exact plan. Approve sends the stored `plan_hash`. Reject sends the plan id only.
+4. After approval, you can generate and download `main.tf`. The file states that nothing was deployed.
 
-If the wording is wrong, the author writes a new sentence. That creates a new plan. Reject records that the current plan must not proceed. It does not edit the sentence.
+If the wording is wrong, write a new sentence. That creates a new plan. Reject records that the current plan must not proceed. It does not edit the sentence. The two buttons are two different actions for the same person.
 
 A plan that fails schema stays a `draft` and is still stored (**HTTP 201**). A plan that fails policy or pricing stays `evaluated`. Approve returns **409** in both cases. A warning, such as a medium or large SKU in development, stays visible and does not block approval.
 
@@ -226,7 +242,7 @@ Two processes. Streamlit is an HTTP client. FastAPI owns the rules and the plan 
 
 ```mermaid
 flowchart LR
-  Author["Author and reviewer"] --> UI["Streamlit\nui/app.py"]
+  Person["One person"] --> UI["Streamlit\nui/app.py"]
   UI -->|"HTTP /v1"| API["FastAPI\napp/main.py"]
   API --> Svc["PlanService\napp/services.py"]
   Svc --> Planner["Untrusted planner\nmock or model string"]
