@@ -8,8 +8,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.artifacts import render_artifact
-from app.llm import ProviderError
-from app.main import app, get_plan_service
+from app.chatgpt_auth import ChatGPTAuth
+from app.llm import PlanUsage, PlanUsageAuthError, ProviderError
+from app.main import app, get_chatgpt_auth, get_plan_service
 from app.models import PlanRecord, ProposedPlan
 from app.services import PlanService
 from app.store import InMemoryStore
@@ -47,7 +48,9 @@ class _BoomPlanner:
 def api():
     store = InMemoryStore()
     service = PlanService(store)
+    auth = ChatGPTAuth()
     app.dependency_overrides[get_plan_service] = lambda: service
+    app.dependency_overrides[get_chatgpt_auth] = lambda: auth
     try:
         yield TestClient(app), store, service
     finally:
@@ -1026,6 +1029,136 @@ def test_failed_model_call_duration_is_logged(
     )
     assert response.status_code == 422
     assert re.search(r"model call provider=openai model=gpt-5 model_ms=\d+ outcome=provider_error", caplog.text)
+
+
+CHATGPT_TOKEN = "chatgpt-access-token-do-not-store"
+
+
+class _SignedIn(ChatGPTAuth):
+    """A ChatGPT sign-in that never calls OpenAI."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.active = True
+
+    @property
+    def signed_in(self) -> bool:
+        return self.active
+
+    def plan_usage(self, **_kwargs: object) -> PlanUsage:
+        return PlanUsage(token=CHATGPT_TOKEN, models=("gpt-6.1-sol",))
+
+    def status(self) -> dict[str, object]:
+        return {"signed_in": self.active, "models": ["gpt-6.1-sol"] if self.active else []}
+
+    def sign_out(self) -> None:
+        self.active = False
+
+
+def test_chatgpt_sign_in_is_used_when_the_key_is_blank(
+    api, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, store, _service = api
+    auth = _SignedIn()
+    app.dependency_overrides[get_chatgpt_auth] = lambda: auth
+    caplog.set_level(logging.INFO, logger="app")
+    seen: dict[str, object] = {}
+
+    def fake(provider: str, model: str | None, api_key: str | None, prompt: str, **kwargs: object) -> str:
+        seen.update(kwargs, api_key=api_key)
+        return "{not json"
+
+    monkeypatch.setattr("app.main.complete_plan", fake)
+    response = client.post(
+        "/v1/plans",
+        json={"prompt": EXAMPLE_PROMPT, "provider": "openai", "model": "gpt-6.1-sol", "api_key": ""},
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["generator"] == "openai-chatgpt:gpt-6.1-sol"
+    assert body["status"] == "draft"
+    assert body["validation_errors"]
+    plan_usage = seen["plan_usage"]
+    assert isinstance(plan_usage, PlanUsage) and plan_usage.token == CHATGPT_TOKEN
+    stored = store.get(UUID(str(body["id"])))
+    assert stored is not None
+    assert CHATGPT_TOKEN not in stored.model_dump_json()
+    assert CHATGPT_TOKEN not in response.text
+    assert CHATGPT_TOKEN not in caplog.text
+    assert "credential=chatgpt_plan" in caplog.text
+
+
+def test_typed_key_wins_over_the_chatgpt_sign_in(api, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _store, _service = api
+    app.dependency_overrides[get_chatgpt_auth] = lambda: _SignedIn()
+    seen: dict[str, object] = {}
+
+    def fake(provider: str, model: str | None, api_key: str | None, prompt: str, **kwargs: object) -> str:
+        seen.update(kwargs)
+        return _model_plan([_DB_SMALL])
+
+    monkeypatch.setattr("app.main.complete_plan", fake)
+    response = client.post(
+        "/v1/plans",
+        json={"prompt": EXAMPLE_PROMPT, "provider": "openai", "model": "gpt-5", "api_key": "sk-test"},
+    )
+    assert response.status_code == 201
+    assert response.json()["generator"] == "openai:gpt-5"
+    assert seen["plan_usage"] is None
+
+
+def test_rejected_chatgpt_sign_in_is_forgotten(api, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, store, _service = api
+    auth = _SignedIn()
+    app.dependency_overrides[get_chatgpt_auth] = lambda: auth
+
+    def fake(*_args: object, **_kwargs: object) -> str:
+        raise PlanUsageAuthError("OpenAI no longer accepts the ChatGPT sign-in. Sign in with ChatGPT again.")
+
+    monkeypatch.setattr("app.main.complete_plan", fake)
+    response = client.post(
+        "/v1/plans",
+        json={"prompt": EXAMPLE_PROMPT, "provider": "openai", "model": "gpt-6.1-sol"},
+    )
+    assert response.status_code == 422
+    assert response.json()["code"] == "provider_error"
+    assert auth.signed_in is False
+    assert store.list_records() == []
+
+
+def test_chatgpt_session_routes_never_return_a_token(api) -> None:
+    client, _store, _service = api
+    auth = _SignedIn()
+    app.dependency_overrides[get_chatgpt_auth] = lambda: auth
+    session = client.get("/v1/openai/session")
+    assert session.status_code == 200
+    assert session.json() == {"signed_in": True, "models": ["gpt-6.1-sol"]}
+    assert CHATGPT_TOKEN not in session.text
+    signed_out = client.post("/v1/openai/sign-out")
+    assert signed_out.json() == {"signed_in": False, "models": []}
+
+
+def test_sign_in_route_returns_a_loopback_authorize_url(api, monkeypatch: pytest.MonkeyPatch) -> None:
+    client, _store, _service = api
+    monkeypatch.setenv("OPENAI_CALLBACK_PORT", "8123")
+    response = client.get("/v1/openai/sign-in")
+    assert response.status_code == 200
+    url = response.json()["authorize_url"]
+    assert url.startswith("https://auth.openai.com/api/accounts/authorize?")
+    assert "redirect_uri=http%3A%2F%2F127.0.0.1%3A8123%2Fcallback" in url
+
+
+def test_callback_with_a_bad_state_shows_an_escaped_error_page(api) -> None:
+    client, _store, _service = api
+    client.get("/v1/openai/sign-in")
+    response = client.get("/callback", params={"code": "c", "state": "wrong", "client_id": "x"})
+    assert response.status_code == 400
+    assert "did not match" in response.text
+    assert "Traceback" not in response.text
+
+    denied = client.get("/callback", params={"error": "<script>alert(1)</script>"})
+    assert denied.status_code == 400
+    assert "<script>" not in denied.text
 
 
 def test_schema_endpoint_matches_proposed_plan_schema(api) -> None:

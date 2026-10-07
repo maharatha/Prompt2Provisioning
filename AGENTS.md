@@ -43,6 +43,7 @@ app/
   planner.py           # mock LLM; returns str only
   lexicon.py           # rewrites DevOps wording for planner.py; text only
   llm.py               # optional OpenAI / Anthropic call; returns str only
+  chatgpt_auth.py      # optional "Sign in with ChatGPT" OAuth; holds the token in memory
   validation.py        # JSON parse + schema
   policies.py          # policy functions; never mutate the plan
   pricing.py           # Decimal estimates from local catalog
@@ -79,6 +80,13 @@ Do not add `core/domain/infrastructure` folders, repository interfaces, or a sec
   - Ask the provider for JSON only (OpenAI JSON mode, Claude `output_config.format` JSON schema). That limits what the model may write. Never strip fences, parse partial output, or otherwise repair the returned text.
   - Reject a reply over 32 KB, or one the provider marks as refused or cut off, as a `provider_error`, and store nothing.
   - Tests use `httpx.MockTransport`. No test calls a real provider.
+- Optional ChatGPT sign-in (`chatgpt_auth.py`), for OpenAI only. Rules:
+  - It uses OpenAI's open-source "Sign in with ChatGPT" flow: OAuth 2.0 + PKCE, a `http://127.0.0.1:{OPENAI_CALLBACK_PORT}/callback` loopback served by the API, and no client secret. Compare `state` with `hmac.compare_digest`; a state works once and expires after 10 minutes.
+  - Access and refresh tokens live only in API process memory. Never put them on a record, log them, return them from a route, or write them to disk. A restart means signing in again.
+  - A typed API key wins. A blank OpenAI key falls back to the sign-in. The generator label becomes `openai-chatgpt:<model>`.
+  - The plan route is the Responses API with `stream: true`, `store: false`, and `text.format` JSON mode. The allowlist is the account's own `/v1/models` list. The 32 KB limit, the refusal and cut-off rules, and the "never repair" rule all apply. A reply counts only after `response.completed`.
+  - An HTTP 401 from the plan route signs the session out.
+  - Anthropic has no sign-in for third-party apps. Claude keeps API-key only.
 - Do not add repository interfaces, policy DSLs, queues, event buses, cloud SDKs, background jobs, or microservices.
 
 ### Module trust table
@@ -88,6 +96,7 @@ Do not add `core/domain/infrastructure` folders, repository interfaces, or a sec
 | `planner.py` | Return a JSON **string**; `explain()` lists every rewrite it applied | Validate, score policy, price, approve, write artifacts, repair JSON |
 | `lexicon.py` | Rewrite request text using `data/lexicon.json`; correct only one-edit typos of listed distinctive words; record every rewrite | Correct silently; correct toward words with a common English word one edit away; build or validate plans |
 | `llm.py` | Return the provider's text **string**; ask for JSON-only output | Store or log the key; repair, strip, or validate the text; be the default |
+| `chatgpt_auth.py` | Run the OAuth exchange and refresh; hand `llm.py` a token and model list | Log, return, store on a record, or persist a token; call a model |
 | `validation.py` | `json.loads` + `ProposedPlan.model_validate` | Mutate or default invalid fields |
 | `policies.py` | Return policy results | Change the plan |
 | `pricing.py` | Sum catalog prices with Decimal | Approve or generate IaC; skip unpriced lines |
@@ -290,6 +299,10 @@ Base path `/v1`. JSON only. No authentication. Run one API worker. Handlers call
 | `POST` | `/v1/plans/{plan_id}/reject` | No body. The plan id is the only input. `draft` or `evaluated` → `rejected`, preserving the proposal, hash, and evaluation results. **200** updated `PlanRecord`. **409** for `approved`, `rejected`, or `artifact_generated`. |
 | `POST` | `/v1/plans/{plan_id}/artifact` | No body. Approved plan whose current hash still matches → updated `PlanRecord` with the HCL in `artifact`. **409** when refused, including a rejected plan or a repeated generation. |
 | `GET` | `/v1/schema/plan` | `ProposedPlan.model_json_schema()`. |
+| `GET` | `/v1/openai/sign-in` | `{ "authorize_url" }` for "Sign in with ChatGPT". |
+| `GET` | `/callback` | OAuth loopback target. Plain escaped HTML page; **400** when the state, code, or exchange fails. |
+| `GET` | `/v1/openai/session` | `{ "signed_in", "models" }` (plus `message` when a check failed). Never a token. |
+| `POST` | `/v1/openai/sign-out` | Forget the sign-in. Returns the session body. |
 | `GET` | `/health` | `{ "status": "ok", "service": "prompt-to-provisioning-planner" }`. |
 
 Plan routes return `PlanRecord`: `id`, `prompt`, `raw_output`, `generator`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `interpretation_notes`, `defaults_applied`, `artifact`, `created_at`, `updated_at`. Include `raw_output` so the UI can show untrusted JSON. `prompt` is at most 2,000 characters. `interpretation_notes` lists differences between a model plan and the built-in planner's reading of the same prompt. Keep it a reviewer hint: never a policy result, never an approval gate, never part of the hash, and rendered as plain text. `defaults_applied` follows the same rules. It names every region, environment, size, storage capacity, and owner or cost-center tag the plan filled in because the request did not state it. Never apply a default without listing it there. `artifact` is null until generation. Currency amounts are JSON strings from Pydantic, not floats. Request-body and UUID failures use FastAPI's **422** `detail` body. Service errors contain only `code` and `message`, with no stack trace.

@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from app.llm import ProviderError, complete_plan
+from app.llm import PlanUsage, PlanUsageAuthError, ProviderError, complete_plan
 
 SECRET = "sk-demo-secret-do-not-store"
 
@@ -243,3 +243,143 @@ def test_blank_key_and_unknown_model_fail_before_a_call() -> None:
         complete_plan("openai", "gpt-4.1-mini", "   ", "one database")
     with pytest.raises(ProviderError, match="listed models"):
         complete_plan("openai", "gpt-nope", SECRET, "one database")
+
+
+TOKEN = "chatgpt-access-token-do-not-store"
+PLAN = PlanUsage(token=TOKEN, models=("gpt-6.1-sol",))
+
+
+def _sse(*events: dict[str, object]) -> str:
+    return "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
+
+
+def _delta(text: str) -> dict[str, object]:
+    return {"type": "response.output_text.delta", "delta": text}
+
+
+_COMPLETED = {"type": "response.completed", "response": {"status": "completed"}}
+
+
+def _plan_call(stream: str, *, status: int = 200, seen: dict[str, object] | None = None) -> str:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen["url"] = str(request.url)
+            seen["authorization"] = request.headers["authorization"]
+            seen["body"] = json.loads(request.read().decode())
+        return httpx.Response(status, text=stream, headers={"content-type": "text/event-stream"})
+
+    return complete_plan(
+        "openai",
+        "gpt-6.1-sol",
+        "",
+        "one database",
+        plan_usage=PLAN,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def test_chatgpt_plan_call_streams_the_responses_api() -> None:
+    seen: dict[str, object] = {}
+    text = _plan_call(_sse(_delta('{"region":'), _delta('"us-east-1"}'), _COMPLETED), seen=seen)
+    assert text == '{"region":"us-east-1"}'
+    assert seen["url"] == "https://api.openai.com/v1/responses"
+    assert seen["authorization"] == f"Bearer {TOKEN}"
+    body = seen["body"]
+    assert isinstance(body, dict)
+    assert body["stream"] is True
+    assert body["store"] is False
+    assert body["model"] == "gpt-6.1-sol"
+    assert body["text"] == {"format": {"type": "json_object"}}
+    assert "Do not rewrite the request so those checks will pass." in body["instructions"]
+    # JSON mode is refused unless an input message (not instructions) says "json".
+    assert "json" in body["input"][0]["content"]
+    assert body["input"][-1] == {"role": "user", "content": "one database"}
+    assert all(item["role"] == "user" for item in body["input"])
+    forbidden = {"temperature", "top_p", "max_output_tokens", "metadata", "truncation", "user", "messages"}
+    assert not forbidden & set(body)
+
+
+def test_api_key_wins_over_a_chatgpt_sign_in() -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+    complete_plan(
+        "openai",
+        "gpt-5",
+        SECRET,
+        "one database",
+        plan_usage=PLAN,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert seen["url"] == "https://api.openai.com/v1/chat/completions"
+
+
+def test_chatgpt_plan_allows_only_the_plan_models() -> None:
+    with pytest.raises(ProviderError, match="listed models"):
+        complete_plan("openai", "gpt-5", "", "one database", plan_usage=PLAN)
+
+
+def test_claude_ignores_a_chatgpt_sign_in() -> None:
+    with pytest.raises(ProviderError, match="Enter an API key. The key is not stored."):
+        complete_plan("claude", "claude-sonnet-5-5", "", "one database", plan_usage=PLAN)
+
+
+def test_openai_without_key_or_sign_in_names_both_options() -> None:
+    with pytest.raises(ProviderError, match="sign in with ChatGPT"):
+        complete_plan("openai", "gpt-5", "", "one database")
+
+
+@pytest.mark.parametrize(
+    ("stream", "message"),
+    [
+        (_sse(_delta("{}"), {"type": "response.failed", "response": {"error": {"message": "boom"}}}), "failed"),
+        (_sse(_delta('{"region":'), {"type": "response.incomplete"}), "cut off"),
+        (_sse({"type": "response.refusal.delta", "delta": "no"}, _COMPLETED), "declined"),
+        (_sse(_delta('{"region":"us-east-1"}')), "ended before it finished"),
+        (_sse(_COMPLETED), "no text"),
+        ("data: {not json}\n\n", "unreadable"),
+    ],
+)
+def test_bad_chatgpt_plan_streams_are_provider_errors(stream: str, message: str) -> None:
+    with pytest.raises(ProviderError, match=message):
+        _plan_call(stream)
+
+
+def test_chatgpt_plan_stream_over_32_kb_is_refused() -> None:
+    chunk = "x" * 1024
+    stream = _sse(*[_delta(chunk) for _ in range(33)], _COMPLETED)
+    with pytest.raises(ProviderError, match="32 KB"):
+        _plan_call(stream)
+
+
+def test_chatgpt_plan_stream_at_the_limit_is_returned() -> None:
+    chunk = "x" * 1024
+    assert _plan_call(_sse(*[_delta(chunk) for _ in range(32)], _COMPLETED)) == chunk * 32
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "error", "message"),
+    [
+        (429, {"error": {"code": "subscription_sharing_usage_limit_exceeded"}}, ProviderError, "usage limit"),
+        (403, {"error": {"code": "subscription_sharing_user_not_eligible"}}, ProviderError, "Plus or Pro"),
+        (401, {"error": {"code": "invalid_token"}}, PlanUsageAuthError, "Sign in with ChatGPT again"),
+        (500, {"error": {"message": f"bad {TOKEN}"}}, ProviderError, "HTTP 500"),
+    ],
+)
+def test_chatgpt_plan_http_errors_are_named(
+    status: int, body: dict[str, object], error: type[ProviderError], message: str
+) -> None:
+    with pytest.raises(error, match=message) as caught:
+        _plan_call(json.dumps(body), status=status)
+    assert TOKEN not in str(caught.value)
+
+
+def test_chatgpt_plan_stream_error_redacts_the_token() -> None:
+    stream = _sse({"type": "error", "message": f"token {TOKEN} rejected"})
+    with pytest.raises(ProviderError) as caught:
+        _plan_call(stream)
+    assert TOKEN not in str(caught.value)
+    assert "[redacted]" in str(caught.value)

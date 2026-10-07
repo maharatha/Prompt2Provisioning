@@ -14,6 +14,7 @@ import requests
 from streamlit.testing.v1 import AppTest
 
 from ui.app import (
+    CHATGPT_SESSION_KEY,
     EXAMPLE_PROMPT,
     LIVE_PROMPT_SCRIPT,
     MAX_PROMPT_CHARS,
@@ -27,6 +28,7 @@ from ui.app import (
     format_usd,
     live_prompt_installer_html,
     formatted_json,
+    openai_credential,
     parse_decimal_string,
     plan_verdict,
     prompt_length_html,
@@ -199,9 +201,15 @@ def _disabled(at: AppTest, key: str) -> bool:
     return bool(at.button(key=key).disabled)
 
 
+def _unreachable(*_args: object, **_kwargs: object) -> requests.Response:
+    raise requests.ConnectionError("no API in UI tests")
+
+
 @pytest.fixture
 def planner(monkeypatch: pytest.MonkeyPatch) -> AppTest:
     monkeypatch.setenv("API_BASE_URL", API_ROOT)
+    # Calls a test does not patch fail fast, like an API that is not running.
+    monkeypatch.setattr("requests.request", _unreachable)
     at = AppTest.from_file(APP_PATH, default_timeout=60)
     at.run()
     _assert_ran(at)
@@ -576,6 +584,116 @@ def test_model_planner_ignores_a_previously_chosen_scenario(planner: AppTest) ->
         planner.button(key="generate").click().run()
     _assert_ran(planner)
     assert request.call_args.kwargs["json"]["prompt"] == ASSIGNMENT_EXAMPLE
+
+
+def test_openai_credential_prefers_a_typed_key() -> None:
+    signed_in = {"signed_in": True, "models": ["gpt-6.1-sol"]}
+    assert openai_credential("sk-test", signed_in) == "api_key"
+    assert openai_credential("  ", signed_in) == "chatgpt_plan"
+    assert openai_credential("", {"signed_in": False}) == "none"
+    assert openai_credential("", None) == "none"
+
+
+SIGN_IN_URL = "https://auth.openai.com/api/accounts/authorize?client_id=dynamic_agent_client"
+
+
+def _fake_api(routes: dict[str, object]) -> object:
+    """Answer each API path from ``routes``; record every call."""
+    calls: list[tuple[str, str]] = []
+
+    def fake(method: str, url: str, **_kwargs: object) -> requests.Response:
+        calls.append((method, url))
+        for path, payload in routes.items():
+            if url == f"{API_ROOT}{path}":
+                return _response(200, payload)
+        raise requests.ConnectionError(f"unexpected {url}")
+
+    fake.calls = calls  # type: ignore[attr-defined]
+    return fake
+
+
+def _choose_openai(planner: AppTest, routes: dict[str, object]) -> object:
+    from unittest.mock import patch
+
+    fake = _fake_api(routes)
+    with patch("requests.request", side_effect=fake):
+        planner.selectbox(key="planner_provider").set_value("OpenAI").run()
+    _assert_ran(planner)
+    return fake
+
+
+def _link_buttons(at: AppTest) -> list[object]:
+    return [element.proto for element in at.get("link_button")]
+
+
+def test_openai_shows_a_one_click_sign_in_link_and_steps(planner: AppTest) -> None:
+    fake = _choose_openai(
+        planner,
+        {"/v1/openai/session": {"signed_in": False, "models": []}, "/v1/openai/sign-in": {"authorize_url": SIGN_IN_URL}},
+    )
+    links = _link_buttons(planner)
+    assert [(link.label, link.url) for link in links] == [("Sign in with ChatGPT", SIGN_IN_URL)]
+    text = _page_text(planner)
+    assert "1. Click the button. A new tab opens." in text
+    assert "This page notices within a few seconds." in text
+    assert ("GET", f"{API_ROOT}/v1/openai/session") in fake.calls  # type: ignore[attr-defined]
+
+
+def test_sign_in_link_is_reused_across_reruns(planner: AppTest) -> None:
+    from unittest.mock import patch
+
+    routes = {"/v1/openai/session": {"signed_in": False, "models": []}, "/v1/openai/sign-in": {"authorize_url": SIGN_IN_URL}}
+    _choose_openai(planner, routes)
+    fake = _fake_api(routes)
+    with patch("requests.request", side_effect=fake):
+        planner.run()
+    # A new link would replace the attempt the person may be approving right now.
+    assert ("GET", f"{API_ROOT}/v1/openai/sign-in") not in fake.calls  # type: ignore[attr-defined]
+
+
+def test_existing_sign_in_and_models_load_without_a_click(planner: AppTest) -> None:
+    _choose_openai(planner, {"/v1/openai/session": {"signed_in": True, "models": ["gpt-6.1-sol"]}})
+    assert planner.selectbox(key="chatgpt_model").options == ["gpt-6.1-sol"]
+    assert "Signed in with ChatGPT" in _page_text(planner)
+    assert "Your ChatGPT plan will be used." in _page_text(planner)
+    assert _link_buttons(planner) == []
+
+
+def test_unreachable_sign_in_offers_a_retry_without_retrying_on_its_own(planner: AppTest) -> None:
+    from unittest.mock import patch
+
+    planner.selectbox(key="planner_provider").set_value("OpenAI").run()
+    _assert_ran(planner)
+    assert "The sign-in link could not be loaded from the API." in _page_text(planner)
+    with patch("requests.request", side_effect=_unreachable) as request:
+        planner.run()
+    assert request.call_count == 0
+
+    fake = _fake_api({"/v1/openai/sign-in": {"authorize_url": SIGN_IN_URL}})
+    with patch("requests.request", side_effect=fake):
+        planner.button(key="chatgpt_new_link").click().run()
+    assert [link.url for link in _link_buttons(planner)] == [SIGN_IN_URL]
+
+
+def test_signed_in_openai_planner_sends_a_blank_key_and_the_plan_model(planner: AppTest) -> None:
+    planner.session_state[CHATGPT_SESSION_KEY] = {"signed_in": True, "models": ["gpt-6.1-sol"], "message": None}
+    planner.selectbox(key="planner_provider").set_value("OpenAI").run()
+    request = _click(planner, "generate", _response(201, _record(generator="openai-chatgpt:gpt-6.1-sol")))
+    sent = request.call_args.kwargs["json"]
+    assert sent["provider"] == "openai"
+    assert sent["model"] == "gpt-6.1-sol"
+    assert sent["api_key"] == ""
+
+
+def test_typed_key_is_sent_even_when_signed_in(planner: AppTest) -> None:
+    planner.session_state[CHATGPT_SESSION_KEY] = {"signed_in": True, "models": ["gpt-6.1-sol"], "message": None}
+    planner.selectbox(key="planner_provider").set_value("OpenAI").run()
+    planner.text_input(key="openai_api_key").set_value("sk-test").run()
+    request = _click(planner, "generate", _response(201, _record()))
+    sent = request.call_args.kwargs["json"]
+    assert sent["model"] == "gpt-5"
+    assert sent["api_key"] == "sk-test"
+    assert "The API key will be used." in _page_text(planner)
 
 
 def test_initial_page_shows_the_prototype_notice_and_example(planner: AppTest) -> None:

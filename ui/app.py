@@ -11,6 +11,7 @@ import copy
 import html
 import json
 import os
+import time
 from collections.abc import Callable, Mapping
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
@@ -128,6 +129,13 @@ MAX_PROMPT_CHARS = 2000
 MIN_PROMPT_CHARS = 30
 OPENAI_MODEL = "gpt-5"
 ANTHROPIC_MODEL = "claude-sonnet-5-5"
+# ChatGPT sign-in state as last reported by the API. The token never reaches the UI.
+CHATGPT_SESSION_KEY = "chatgpt_session"
+CHATGPT_SIGN_IN_URL_KEY = "chatgpt_sign_in_url"
+CHATGPT_SIGN_IN_AT_KEY = "chatgpt_sign_in_at"
+# The API keeps a sign-in attempt for 10 minutes; fetch a new link before that.
+SIGN_IN_LINK_SECONDS = 540.0
+SIGN_IN_POLL_SECONDS = 3
 _DECISION_STATUSES = frozenset({"approved", "rejected", "artifact_generated"})
 
 _RECORD_KEYS = (
@@ -568,6 +576,43 @@ def create_plan(
     return request_json("POST", "/v1/plans", json_body=body)
 
 
+def start_chatgpt_sign_in() -> str:
+    payload = _request_payload("GET", "/v1/openai/sign-in", json_body=None)
+    url = payload.get("authorize_url") if isinstance(payload, dict) else None
+    if not isinstance(url, str) or not url.startswith("https://auth.openai.com/"):
+        raise ApiClientError("The API did not return a ChatGPT sign-in link.")
+    return url
+
+
+def fetch_chatgpt_session() -> dict[str, Any]:
+    return _chatgpt_status(_request_payload("GET", "/v1/openai/session", json_body=None))
+
+
+def sign_out_chatgpt() -> dict[str, Any]:
+    return _chatgpt_status(_request_payload("POST", "/v1/openai/sign-out", json_body=None))
+
+
+def _chatgpt_status(payload: object) -> dict[str, Any]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("signed_in"), bool):
+        raise ApiClientError("The API returned an unreadable ChatGPT sign-in status.")
+    models = payload.get("models")
+    message = payload.get("message")
+    return {
+        "signed_in": payload["signed_in"],
+        "models": [item for item in models if isinstance(item, str)] if isinstance(models, list) else [],
+        "message": message if isinstance(message, str) else None,
+    }
+
+
+def openai_credential(api_key: object, session: object) -> str:
+    """Which OpenAI credential a request uses. A typed key wins, as in the API."""
+    if isinstance(api_key, str) and api_key.strip() != "":
+        return "api_key"
+    if isinstance(session, dict) and session.get("signed_in") is True:
+        return "chatgpt_plan"
+    return "none"
+
+
 def fetch_catalog(path: str) -> dict[str, Any]:
     payload = _request_payload("GET", path, json_body=None)
     if not isinstance(payload, dict):
@@ -778,7 +823,7 @@ def _on_generate() -> None:
         }
         return
     if provider in ("OpenAI", "Anthropic"):
-        model = OPENAI_MODEL if provider == "OpenAI" else ANTHROPIC_MODEL
+        model = _openai_model() if provider == "OpenAI" else ANTHROPIC_MODEL
         title = f"Waiting for {provider} ({model})…"
         detail = (
             "Model calls can take up to a minute. When the reply arrives it is checked "
@@ -794,7 +839,7 @@ def _on_generate() -> None:
     overlay.markdown(busy_overlay_html(title, detail), unsafe_allow_html=True)
     try:
         if provider == "OpenAI":
-            _generate_with_model("openai", OPENAI_MODEL, "openai_api_key", text)
+            _generate_with_openai(text)
         elif provider == "Anthropic":
             _generate_with_model("claude", ANTHROPIC_MODEL, "anthropic_api_key", text)
         else:
@@ -802,6 +847,158 @@ def _on_generate() -> None:
             _call(lambda: create_plan(prompt))
     finally:
         overlay.empty()
+
+
+def _openai_model() -> str:
+    """gpt-5 with an API key; with a ChatGPT sign-in, a model from the plan's list."""
+    session = st.session_state.get(CHATGPT_SESSION_KEY)
+    if openai_credential(st.session_state.get("openai_api_key", ""), session) != "chatgpt_plan":
+        return OPENAI_MODEL
+    models = session.get("models") or []
+    chosen = st.session_state.get("chatgpt_model")
+    if isinstance(chosen, str) and chosen in models:
+        return chosen
+    return models[0] if models else ""
+
+
+def _generate_with_openai(text: str) -> None:
+    session = st.session_state.get(CHATGPT_SESSION_KEY)
+    if openai_credential(st.session_state.get("openai_api_key", ""), session) != "chatgpt_plan":
+        _generate_with_model("openai", OPENAI_MODEL, "openai_api_key", text)
+        return
+    model = _openai_model()
+    if model == "":
+        _remember_error(
+            ApiClientError("Your ChatGPT plan's models are not loaded yet. Click Reload models.")
+        )
+        return
+    # A blank key tells the API to use the ChatGPT sign-in it holds.
+    _call(lambda: create_plan(text, provider="openai", model=model, api_key=""))
+
+
+def _refresh_chatgpt_session(*, report: bool) -> dict[str, Any] | None:
+    """Ask the API whether a ChatGPT plan is signed in. It loads the plan's models."""
+    try:
+        session = fetch_chatgpt_session()
+    except ApiClientError as exc:
+        if report:
+            _remember_error(exc)
+        return None
+    st.session_state[CHATGPT_SESSION_KEY] = session
+    if session["signed_in"]:
+        st.session_state[CHATGPT_SIGN_IN_URL_KEY] = None
+    if report:
+        if session["message"]:
+            _remember_error(ApiClientError(session["message"]))
+        else:
+            st.session_state[API_ERROR_KEY] = None
+    return session
+
+
+def _chatgpt_sign_in_link() -> str | None:
+    """A sign-in link, fetched once and renewed before the API's 10-minute limit."""
+    url = st.session_state.get(CHATGPT_SIGN_IN_URL_KEY)
+    fetched_at = st.session_state.get(CHATGPT_SIGN_IN_AT_KEY)
+    fresh = isinstance(fetched_at, float) and time.time() - fetched_at < SIGN_IN_LINK_SECONDS
+    if url == "":
+        return None  # The last fetch failed; "Try again" clears this.
+    if isinstance(url, str) and fresh:
+        return url
+    try:
+        url = start_chatgpt_sign_in()
+    except ApiClientError:
+        st.session_state[CHATGPT_SIGN_IN_URL_KEY] = ""
+        return None
+    st.session_state[CHATGPT_SIGN_IN_URL_KEY] = url
+    st.session_state[CHATGPT_SIGN_IN_AT_KEY] = time.time()
+    return url
+
+
+@st.fragment(run_every=SIGN_IN_POLL_SECONDS)
+def _watch_for_chatgpt_sign_in() -> None:
+    """Notice a sign-in finished in the other tab, then redraw the whole page.
+
+    Only this small fragment re-runs on the timer, so typing is not disturbed.
+    """
+    fetched_at = st.session_state.get(CHATGPT_SIGN_IN_AT_KEY)
+    if not isinstance(fetched_at, float) or time.time() - fetched_at > SIGN_IN_LINK_SECONDS:
+        return
+    session = _refresh_chatgpt_session(report=False)
+    if session is not None and session["signed_in"]:
+        st.rerun()
+
+
+def _on_chatgpt_reload() -> None:
+    _refresh_chatgpt_session(report=True)
+
+
+def _on_chatgpt_new_link() -> None:
+    st.session_state[CHATGPT_SIGN_IN_URL_KEY] = None
+
+
+def _on_chatgpt_sign_out() -> None:
+    try:
+        st.session_state[CHATGPT_SESSION_KEY] = sign_out_chatgpt()
+    except ApiClientError as exc:
+        _remember_error(exc)
+        return
+    st.session_state[CHATGPT_SIGN_IN_URL_KEY] = None
+    st.session_state[API_ERROR_KEY] = None
+
+
+def _render_chatgpt_sign_in() -> None:
+    """"Sign in with ChatGPT" first, an API key as the alternative. A typed key wins."""
+    if CHATGPT_SESSION_KEY not in st.session_state:
+        # First look at OpenAI in this browser tab: the API may already hold a sign-in.
+        st.session_state[CHATGPT_SESSION_KEY] = None
+        _refresh_chatgpt_session(report=False)
+    session = st.session_state.get(CHATGPT_SESSION_KEY)
+    signed_in = isinstance(session, dict) and session.get("signed_in") is True
+    using_key = openai_credential(st.session_state.get("openai_api_key", ""), session) == "api_key"
+
+    if signed_in:
+        st.success("Signed in with ChatGPT")
+        models = session.get("models") or []
+        if models:
+            st.selectbox(
+                "Model from your ChatGPT plan",
+                options=models,
+                key="chatgpt_model",
+                disabled=using_key,
+            )
+        else:
+            st.caption("Your plan's models could not be loaded.")
+            st.button("Reload models", key="chatgpt_reload", on_click=_on_chatgpt_reload)
+        st.button("Sign out", key="chatgpt_sign_out", on_click=_on_chatgpt_sign_out)
+    else:
+        url = _chatgpt_sign_in_link()
+        if url is None:
+            st.caption("The sign-in link could not be loaded from the API.")
+            st.button("Try again", key="chatgpt_new_link", on_click=_on_chatgpt_new_link)
+        else:
+            st.link_button("Sign in with ChatGPT", url, use_container_width=True)
+            st.caption(
+                "Use your ChatGPT Plus or Pro plan instead of an API key:\n"
+                "1. Click the button. A new tab opens.\n"
+                "2. Sign in and approve.\n"
+                "3. Come back here. This page notices within a few seconds."
+            )
+            message = session.get("message") if isinstance(session, dict) else None
+            if isinstance(message, str) and message:
+                st.caption(message)
+            _watch_for_chatgpt_sign_in()
+
+    with st.expander("Use an OpenAI API key instead", expanded=using_key):
+        st.text_input(
+            "API key",
+            type="password",
+            key="openai_api_key",
+            help="Used for this request only. It is not stored. A key here is used instead of your ChatGPT sign-in.",
+        )
+    if using_key:
+        st.caption(f"Model: {OPENAI_MODEL}. The API key will be used.")
+    elif signed_in:
+        st.caption("Your ChatGPT plan will be used.")
 
 
 def _generate_with_model(provider: str, model: str, secret_key: str, text: str) -> None:
@@ -1269,13 +1466,7 @@ def _render_request(record: object) -> None:
             )
             planner_choice = st.session_state.get("planner_provider", PLANNER_BUILTIN)
             if planner_choice == "OpenAI":
-                st.caption(f"Model: {OPENAI_MODEL}. Chosen for this interpretation task.")
-                st.text_input(
-                    "API key",
-                    type="password",
-                    key="openai_api_key",
-                    help="Used for this request only. It is not stored.",
-                )
+                _render_chatgpt_sign_in()
             elif planner_choice == "Anthropic":
                 st.caption(f"Model: {ANTHROPIC_MODEL}. Chosen for this interpretation task.")
                 st.text_input(
@@ -1409,7 +1600,7 @@ def _render_review_identity(record: Mapping[str, Any]) -> None:
     generator = record.get("generator")
     if isinstance(generator, str) and generator:
         st.caption(f"Planner: {generator}")
-        if generator.startswith("openai:") or generator.startswith("claude:"):
+        if generator.startswith(("openai:", "openai-chatgpt:", "claude:")):
             st.caption(
                 "The model interpreted the sentence. The checks below are the decision."
             )

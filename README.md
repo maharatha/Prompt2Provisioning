@@ -22,6 +22,7 @@ Each plan lives in a Python dictionary inside the running API process. Stop or r
 |---|---|
 | Prompt, proposal, decision, and dry-run file | API process memory only. Lost on restart. |
 | OpenAI or Anthropic API key | Sent with that one generate request. Not written to the plan, the logs, or disk. |
+| "Sign in with ChatGPT" access and refresh tokens | API process memory only, until sign-out, a rejected token, or restart. Never returned to the UI, written to the plan, logged, or saved to disk. |
 | Log lines | API process stderr. They name the plan id, status, and outcome, and omit the prompt and the key. |
 | `app/data/prices.json`, `app/data/policy.json`, `app/data/lexicon.json` | Rate table, allow-lists, and planner vocabulary that ship with the repository. Not a request history. |
 | Downloaded `main.tf` | A file on your computer. The application does not upload or run it. |
@@ -302,9 +303,9 @@ Business rules live in `app/services.py` and the modules it calls. Route handler
 | Streamlit | Demo UI |
 | pytest and FastAPI `TestClient` | Tests. Docker is not required |
 | `requirements.txt` | Runtime packages at the repository root |
-| `requirements-dev.txt` | Runtime packages plus `pytest` and `httpx` |
+| `requirements-dev.txt` | Runtime packages plus `pytest` |
 
-Approved runtime packages: `fastapi`, `uvicorn`, `pydantic`, `jinja2`, `streamlit`, `requests`.
+Approved runtime packages: `fastapi`, `uvicorn`, `pydantic`, `jinja2`, `streamlit`, `requests`, `httpx`. The API uses `httpx` for the optional model call and the ChatGPT sign-in. `tests/test_requirements.py` fails if `app/` or `ui/` imports a package that `requirements.txt` does not list, because the Docker images install only that file.
 
 ### Persistence
 
@@ -498,6 +499,10 @@ Base path `/v1`. JSON only. No authentication. Handlers are async and call the s
 | `GET` | `/v1/catalog/prices` | Synthetic price table. Rates stay JSON strings. |
 | `GET` | `/v1/catalog/policy` | Policy allow-lists. Check functions still apply them. |
 | `GET` | `/v1/schema/plan` | `ProposedPlan` JSON Schema. |
+| `GET` | `/v1/openai/sign-in` | `{ "authorize_url" }` to start "Sign in with ChatGPT". |
+| `GET` | `/callback` | OAuth loopback page that OpenAI redirects the browser to. **400** with an escaped message when sign-in fails. |
+| `GET` | `/v1/openai/session` | `{ "signed_in", "models" }`, plus `message` when a check failed. Never a token. |
+| `POST` | `/v1/openai/sign-out` | Forget the ChatGPT sign-in. |
 | `GET` | `/health` | `{ "status": "ok", "service": "prompt-to-provisioning-planner" }`. |
 
 Create body:
@@ -513,9 +518,9 @@ Create body:
 
 `prompt` is required and must be 30 to 2,000 characters after trimming. A prompt containing `SCENARIO:` is exempt from the minimum, because the UI sends the bare token. A shorter prompt is **422**, with a message that names the minimum. `provider` is `mock` (the default), `openai`, or `claude`. Extra fields are rejected. Blank prompts, non-strings, and invalid UUIDs are FastAPI **422** responses with a `detail` body.
 
-For `openai` or `claude`, `model` must be one of the allowlisted ids and `api_key` must be non-blank. The UI sends `gpt-5` or `claude-sonnet-5-5`. A provider failure is **422** `{ "code": "provider_error", "message" }` and is not stored. An unknown `SCENARIO:` name on the built-in planner is **422** `{ "code": "unknown_scenario", "message" }` and is not stored.
+For `openai` or `claude`, `model` must be one of the allowlisted ids and `api_key` must be non-blank. The exception is `openai` with a blank key while a ChatGPT sign-in is active: then `model` must be one of that plan's models (see [Sign in with ChatGPT](#sign-in-with-chatgpt)). The UI sends `gpt-5` or `claude-sonnet-5-5`. A provider failure is **422** `{ "code": "provider_error", "message" }` and is not stored. An unknown `SCENARIO:` name on the built-in planner is **422** `{ "code": "unknown_scenario", "message" }` and is not stored.
 
-`PlanRecord` fields: `id`, `prompt`, `raw_output`, `generator`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `interpretation_notes`, `artifact`, `created_at`, `updated_at`. `generator` is `mock` or `openai:<model>` / `claude:<model>`. `interpretation_notes` lists the built-in planner's rewrites, or, for a model plan, its differences from the built-in reading (see [Guardrails on model output](#guardrails-on-model-output)). `defaults_applied` lists every value the request did not state, for any planner. Examples: *"Region: the request names none, so the plan uses us-east-1."*, *"Size: none given for web (container), so it uses container-small, the smallest tier."*, and owner or cost-center tags the request did not name. When a request names an owner, the built-in planner says it did not read it. Both lists are empty for drafts and `SCENARIO:` fixtures. Neither is policy, an approval gate, or part of the hash. The Work page shows defaults in a blue **Defaults the plan used** box, and the review banner gives their count. `artifact` is null until generation. `raw_output` is the untrusted generator string so the UI can show it.
+`PlanRecord` fields: `id`, `prompt`, `raw_output`, `generator`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `interpretation_notes`, `artifact`, `created_at`, `updated_at`. `generator` is `mock`, `openai:<model>`, `openai-chatgpt:<model>` (ChatGPT plan), or `claude:<model>`. `interpretation_notes` lists the built-in planner's rewrites, or, for a model plan, its differences from the built-in reading (see [Guardrails on model output](#guardrails-on-model-output)). `defaults_applied` lists every value the request did not state, for any planner. Examples: *"Region: the request names none, so the plan uses us-east-1."*, *"Size: none given for web (container), so it uses container-small, the smallest tier."*, and owner or cost-center tags the request did not name. When a request names an owner, the built-in planner says it did not read it. Both lists are empty for drafts and `SCENARIO:` fixtures. Neither is policy, an approval gate, or part of the hash. The Work page shows defaults in a blue **Defaults the plan used** box, and the review banner gives their count. `artifact` is null until generation. `raw_output` is the untrusted generator string so the UI can show it.
 
 Service errors are `{ "code", "message" }` only. Responses do not include stack traces. Common **409** codes: `status`, `submitted_hash`, `current_hash`, `validation_errors`, `policy_error`, `pricing`, `missing_proposal`, `missing_plan_hash`.
 
@@ -543,7 +548,7 @@ The **Examples** menu beside the request box lists sample requests grouped by wh
 
 A UI test sends every example through the real plan service and checks the stated outcome and price, so this table cannot drift from the app.
 
-The planner control offers **Built-in**, **OpenAI**, and **Anthropic**. The model id is fixed for each provider. The API key is a password field, is sent only on that generate request, and is not written to the plan, logs, or disk.
+The planner control offers **Built-in**, **OpenAI**, and **Anthropic**. The model id is fixed for each provider. The API key is a password field, is sent only on that generate request, and is not written to the plan, logs, or disk. Under OpenAI, **Sign in with ChatGPT** comes first, with three numbered steps. The API key field is under **Use an OpenAI API key instead**. The page notices a finished sign-in by itself and then lists the plan's models. A caption says which credential the next request will use.
 
 **Generate plan** is always the coloured primary button. It is disabled until the request has at least 30 characters, or a demo scenario is selected. A line under the box shows *"✓ 66 characters"* or *"✗ 14 of 30 characters. Add 16 more…"*. Both update **as you type**. Streamlit only sends a text box's value on Ctrl+Enter or blur, so a small script installed in the page (`LIVE_PROMPT_SCRIPT` in `ui/app.py`) updates them on each keystroke and after each redraw. The server never disables the button itself, because React would then swallow the first click after typing. If the script does not run, `_on_generate` still refuses a short request with a message, and the API returns **422**. While a plan is being generated, a full-screen overlay dims the page and shows a centred spinner. For OpenAI or Anthropic it names the model and says the reply can take up to a minute, so a slow model call does not look like a frozen page.
 
@@ -566,7 +571,7 @@ Both planners are untrusted proposal generators. The checks after them are the s
 
 **Every rewrite is shown.** For a built-in plan, `interpretation_notes` lists each one: *"Read 'rds' as PostgreSQL (DevOps term)."*, *"Read 'dataabse' as 'database' (likely typo, one letter off)."*, *"Read 'api x3' as quantity 3."* The Work page shows them under **How the request was read**. The rule is: **correct only when the meaning is unambiguous, always show the correction, and refuse otherwise.**
 
-Edit distance cannot tell a typo from a real word: *staying* is one edit from *staging*, and *backed* is one edit from *backend*. So the typo targets are a short list chosen to have no common English word nearby. A scan of 25,000 distinct words found no harmful corrections. The look-alikes it found are pinned in [tests/test_lexicon.py](tests/test_lexicon.py), and `not_typos` in the lexicon lists the exceptions. [tests/planner_cases.json](tests/planner_cases.json) holds 50 realistic DevOps requests with the plan or refusal each must produce. Add a case there whenever the lexicon changes.
+Edit distance cannot tell a typo from a real word: *staying* is one edit from *staging*, and *backed* is one edit from *backend*. So the typo targets are a short list chosen to have no common English word nearby. A scan of 25,000 distinct words found no harmful corrections. The look-alikes it found are pinned in [tests/test_lexicon.py](tests/test_lexicon.py), and `not_typos` in the lexicon lists the exceptions. [tests/planner_cases.json](tests/planner_cases.json) holds 51 realistic DevOps requests with the plan or refusal each must produce. Add a case there whenever the lexicon changes.
 
 | Phrase (after normalization) | Result |
 |---|---|
@@ -645,6 +650,37 @@ What this means when you read a model plan:
 - **Tags come from defaults.** The brief tells the model to use `owner=dev-team` and `cost-center=engineering` when the prompt names neither, just as the built-in planner does. A `required_tags` pass on a model plan therefore says the keys are present. It does not say the person supplied them. Use `SCENARIO:missing_tags` to see that policy fail.
 - **Plans are not repeatable.** The same prompt can produce a different plan and a different `plan_hash` on each call. Approval is unaffected, because the hash is bound to the stored proposal, not to the prompt. Each generate is a new plan to review.
 
+#### Sign in with ChatGPT
+
+Since OpenAI DevDay (2026-09-29), a ChatGPT **Plus or Pro** subscriber can let an open-source app bill model calls to their plan, with no API key. OpenAI launched it as a limited preview with a small set of partner tools, so whether a given account can complete the sign-in depends on OpenAI's rollout. The OpenAI planner supports this as a second credential. A typed API key still wins, so you can switch between them without signing out.
+
+1. Choose **OpenAI** and click **Sign in with ChatGPT**. A new tab opens on OpenAI.
+2. Sign in, pick a workspace, and approve plan usage. OpenAI sends that tab to `http://127.0.0.1:8000/callback`, which the API serves and which says you can close the tab.
+3. Return to the Work page. While a sign-in is open, a small fragment checks the API every 3 seconds, so the page already shows **Signed in with ChatGPT** and a menu of your plan's models. Generate as usual.
+
+On choosing OpenAI, the page also asks the API once whether it already holds a sign-in, so a page refresh does not lose it. An API key goes in **Use an OpenAI API key instead**; when one is typed, it is used and the plan model menu is greyed out.
+
+How it works (`app/chatgpt_auth.py`): OAuth 2.0 with PKCE (S256) and the self-serve `dynamic_agent_client` registration, so there is no client secret.
+- `state` is random, works once, and expires after 10 minutes.
+- The code is exchanged for a one-hour access token and a refresh token, both kept in API memory only.
+- The access token is refreshed a minute before it expires. If refresh fails, or OpenAI returns 401, the sign-in is forgotten.
+- The ID token is not used to identify anyone, so its signature is not checked (that would need a JWT library). `state` and PKCE protect the exchange.
+
+The model call (`app/llm.py`) uses the Responses API, as the plan route requires:
+- Request: `stream: true`, `store: false`, the brief as `instructions`, and JSON mode (`text.format: json_object`). JSON mode needs the word "json" in an input message, and `instructions` don't count. A fixed first message asks for a json reply, and the request text follows as its own message, unchanged.
+- The model must be one the account's `/v1/models` list returns.
+- Streamed text is joined, and it counts only after `response.completed`.
+- Refusals, `response.incomplete`, `response.failed`, a stream that stops early, and anything over 32 KB are `provider_error` and are not stored.
+- A usage-limit 429 and a not-eligible 403 get plain messages.
+- The plan is labelled `openai-chatgpt:<model>`, and the duration log says `credential=chatgpt_plan`.
+
+Limits:
+- The browser must run on the same machine as the API, because the callback is a `127.0.0.1` loopback. Under Docker Compose, the API's `127.0.0.1:8000` port mapping serves it. Set `OPENAI_CALLBACK_PORT` if the API is published on another host port.
+- Restarting the API means signing in again.
+- Each new process registers the app with OpenAI again, because the host id is not saved to disk.
+
+Anthropic has no equivalent. Claude Pro and Max plans work only in Claude Code, `claude -p`, and the Agent SDK, not in third-party apps over HTTP. The Anthropic planner therefore stays API-key only.
+
 #### Guardrails on model output
 
 Instructions to the model are not a control. A prompt can talk a model out of them. The controls are the limits on what the model can do and the checks on everything it returns:
@@ -687,6 +723,7 @@ Prompt injection ("ignore your instructions and…") can only change the JSON. T
 │   ├── planner.py           # built-in generator
 │   ├── lexicon.py           # DevOps synonyms, quantity phrasing, typo correction
 │   ├── llm.py               # optional model call
+│   ├── chatgpt_auth.py      # optional "Sign in with ChatGPT" OAuth, token in memory
 │   ├── validation.py
 │   ├── policies.py
 │   ├── pricing.py
@@ -712,9 +749,11 @@ Prompt injection ("ignore your instructions and…") can only change the JSON. T
     ├── test_approval.py
     ├── test_artifacts.py
     ├── test_artifact_generation.py
-    ├── test_llm.py                  # provider requests: JSON-only, effort, refusals, size cap
+    ├── test_llm.py                  # provider requests: JSON-only, effort, refusals, size cap, plan streaming
+    ├── test_chatgpt_auth.py         # PKCE, state, code exchange, refresh, sign-out
     ├── test_api.py                  # routes, prompt limits, notes, defaults, logs
     ├── test_health.py
+    ├── test_requirements.py         # requirements.txt lists every runtime import
     └── test_ui.py                   # Streamlit AppTest: banners, examples, live prompt check
 ```
 
@@ -726,11 +765,12 @@ From the repository root, with the virtual environment active:
 python -m pytest
 ```
 
-Tests use FastAPI `TestClient` and inject an empty `InMemoryStore` through `dependency_overrides`. They assert HTTP status, stored status, validation errors, policy rows, decimal totals, hash mismatch, and rendered text. They do not require Docker, a model key, or a network. Provider calls use `httpx.MockTransport`. The suite has 646 tests.
+Tests use FastAPI `TestClient` and inject an empty `InMemoryStore` through `dependency_overrides`. They assert HTTP status, stored status, validation errors, policy rows, decimal totals, hash mismatch, and rendered text. They do not require Docker, a model key, or a network. Provider and OAuth calls use `httpx.MockTransport`. The suite has 694 tests.
 
 What pytest cannot cover:
 - **The in-page live prompt script and the busy overlay** are JavaScript and CSS, which pytest cannot run. They were checked in a real browser (Edge driven by Playwright) during development. Their HTML and script are pinned by unit tests.
 - **Real OpenAI and Anthropic responses** were not exercised without keys. The request shapes are pinned by `test_llm.py`.
+- **A real "Sign in with ChatGPT" round trip** needs a Plus or Pro account and a browser. The authorize URL, token exchange, refresh, and streamed Responses events are pinned by `test_chatgpt_auth.py` and `test_llm.py`. They follow OpenAI's published flow, but no real account has exercised them yet.
 
 Coverage includes a valid generated plan, malformed JSON, missing fields, unexpected fields, an unsupported region, missing tags, public object storage, excessive quantity, excessive storage, an unknown SKU, the decimal totals, a warning that does not block approval, errors that do, a wrong submitted hash, a proposal changed after evaluation, a proposal changed after approval and before render, a rejected plan that cannot render, two identical renders, planner wording (unrecognized resources, negation, region digits, the word "us", number words, synonyms, TB), 51 realistic DevOps requests in `planner_cases.json`, typo correction and its English look-alike guard, unsupported resources and regions, defaults call-outs for every planner, catalog and decision routes, the optional provider boundary (key redaction, OpenAI JSON mode and reasoning effort, a Claude output schema that uses only closed objects and low effort except on Haiku, refused, cut-off, and oversized replies, the prompt length limits, interpretation notes, and call-duration logs), the UI verdict banners, examples, formatted JSON, and prompt check, and the health endpoint.
 

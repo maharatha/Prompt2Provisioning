@@ -6,8 +6,10 @@ await during a create, approval, rejection, or artifact transition. This
 prototype does not lock the in-memory store.
 """
 
+import html
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -15,10 +17,11 @@ from typing import Literal
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from app.llm import ProviderError, complete_plan
+from app.chatgpt_auth import ChatGPTAuth, SignInError
+from app.llm import PlanUsageAuthError, ProviderError, complete_plan
 from app.models import PlanRecord, ProposedPlan
 from app.planner import UnknownScenarioError
 from app.services import PlanNotFound, PlanService, ServiceError
@@ -59,6 +62,20 @@ def get_plan_service() -> PlanService:
     does not construct a new store per request.
     """
     return _plan_service
+
+
+_chatgpt_auth = ChatGPTAuth()
+
+
+def get_chatgpt_auth() -> ChatGPTAuth:
+    """Return this process's ChatGPT sign-in. Tests override it."""
+    return _chatgpt_auth
+
+
+def callback_port() -> int:
+    """The host port where the browser reaches this API for the sign-in callback."""
+    value = os.environ.get("OPENAI_CALLBACK_PORT", "8000")
+    return int(value) if value.isdigit() else 8000
 
 
 class ApiError(BaseModel):
@@ -113,21 +130,35 @@ def _error_content(code: str, message: str) -> dict[str, str]:
     return ApiError(code=code, message=message).model_dump()
 
 
-def _timed_model_call(body: CreatePlanRequest) -> str:
-    """Call the model and log how long it took. The key and prompt are not logged."""
+def _uses_chatgpt_plan(body: CreatePlanRequest, auth: ChatGPTAuth) -> bool:
+    """A typed OpenAI key wins; a blank key falls back to the ChatGPT sign-in."""
+    blank_key = body.api_key is None or body.api_key.strip() == ""
+    return body.provider == "openai" and blank_key and auth.signed_in
+
+
+def _timed_model_call(body: CreatePlanRequest, auth: ChatGPTAuth) -> str:
+    """Call the model and log how long it took. The key, token, and prompt are not logged."""
     start = time.perf_counter()
     outcome = "provider_error"
+    credential = "chatgpt_plan" if _uses_chatgpt_plan(body, auth) else "api_key"
     try:
-        raw_output = complete_plan(body.provider, body.model, body.api_key, body.prompt)
+        plan_usage = auth.plan_usage() if credential == "chatgpt_plan" else None
+        raw_output = complete_plan(
+            body.provider, body.model, body.api_key, body.prompt, plan_usage=plan_usage
+        )
         outcome = "ok"
         return raw_output
+    except PlanUsageAuthError:
+        auth.sign_out()
+        raise
     finally:
         _LOG.info(
-            "model call provider=%s model=%s model_ms=%d outcome=%s",
+            "model call provider=%s model=%s model_ms=%d outcome=%s credential=%s",
             body.provider,
             body.model,
             round((time.perf_counter() - start) * 1000),
             outcome,
+            credential,
         )
 
 
@@ -190,6 +221,7 @@ def health() -> dict[str, str]:
 async def create_plan(
     body: CreatePlanRequest,
     service: PlanService = Depends(get_plan_service),
+    auth: ChatGPTAuth = Depends(get_chatgpt_auth),
 ) -> PlanRecord:
     """Generate, validate, and store a plan.
 
@@ -198,11 +230,12 @@ async def create_plan(
     if body.provider == "mock":
         record = service.create_plan(body.prompt)
     else:
-        raw_output = _timed_model_call(body)
+        source = "openai-chatgpt" if _uses_chatgpt_plan(body, auth) else body.provider
+        raw_output = _timed_model_call(body, auth)
         record = service.create_plan(
             body.prompt,
             raw_output=raw_output,
-            generator=f"{body.provider}:{body.model}",
+            generator=f"{source}:{body.model}",
         )
     _log_plan("created", record)
     return record
@@ -300,3 +333,62 @@ async def policy_catalog() -> dict[str, object]:
 @app.get("/v1/schema/plan")
 async def proposed_plan_schema() -> dict[str, object]:
     return ProposedPlan.model_json_schema()
+
+
+@app.get("/v1/openai/sign-in")
+async def openai_sign_in(auth: ChatGPTAuth = Depends(get_chatgpt_auth)) -> dict[str, str]:
+    """Start "Sign in with ChatGPT". The browser must run on this machine."""
+    return {"authorize_url": auth.start(callback_port())}
+
+
+@app.get("/v1/openai/session")
+async def openai_session(auth: ChatGPTAuth = Depends(get_chatgpt_auth)) -> dict[str, object]:
+    """Whether a ChatGPT plan is signed in, and its models. Never a token.
+
+    The model list is fetched on first check after sign-in.
+    """
+    if auth.signed_in:
+        try:
+            auth.plan_usage()
+        except ProviderError as exc:
+            _LOG.warning("chatgpt session check failed")
+            return {**auth.status(), "message": exc.message}
+    return auth.status()
+
+
+@app.post("/v1/openai/sign-out")
+async def openai_sign_out(auth: ChatGPTAuth = Depends(get_chatgpt_auth)) -> dict[str, object]:
+    auth.sign_out()
+    _LOG.info("chatgpt signed out")
+    return auth.status()
+
+
+@app.get("/callback", response_class=HTMLResponse, include_in_schema=False)
+async def openai_callback(
+    code: str | None = None,
+    state: str | None = None,
+    client_id: str | None = None,
+    error: str | None = None,
+    auth: ChatGPTAuth = Depends(get_chatgpt_auth),
+) -> HTMLResponse:
+    """The loopback page OpenAI sends the browser back to after sign-in."""
+    if error is not None:
+        return _callback_page(f"Sign-in was not completed ({error}).", status_code=400)
+    try:
+        auth.finish(code, state, client_id)
+    except SignInError as exc:
+        _LOG.warning("chatgpt sign-in refused")
+        return _callback_page(exc.message, status_code=400)
+    _LOG.info("chatgpt signed in")
+    return _callback_page(
+        "Signed in with ChatGPT. You can close this tab. The planner page updates by itself within a few seconds.",
+        status_code=200,
+    )
+
+
+def _callback_page(message: str, *, status_code: int) -> HTMLResponse:
+    body = (
+        "<!doctype html><html><head><meta charset='utf-8'><title>Sign in with ChatGPT</title></head>"
+        f"<body style='font-family:sans-serif;margin:3rem'><p>{html.escape(message)}</p></body></html>"
+    )
+    return HTMLResponse(body, status_code=status_code)

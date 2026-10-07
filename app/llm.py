@@ -3,7 +3,12 @@
 The result is one raw string, the same untrusted output the mock planner
 returns. This module does not validate, price, approve, or store the API key.
 
-Both calls ask the provider for JSON only: OpenAI JSON mode, and a Claude
+OpenAI has two credentials. An API key calls Chat Completions. A "Sign in with
+ChatGPT" token (``app.chatgpt_auth``) calls the Responses API against the
+person's ChatGPT plan; that route must stream and must not store the reply.
+A typed API key wins when both are present.
+
+Every call asks the provider for JSON only: OpenAI JSON mode, and a Claude
 structured-output schema. That limits what the model may write. It does not
 change what it wrote, and ``app.validation`` still checks every field. The
 Claude schema is a looser shape than ``ProposedPlan``: structured outputs allow
@@ -12,7 +17,8 @@ three policy keys, each optional, and quantity has no range.
 """
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -31,6 +37,10 @@ _CLAUDE_EFFORT_MODELS = frozenset({"claude-sonnet-5-5", "claude-opus-5-5"})
 _LOW_EFFORT = "low"
 _TIMEOUT_SECONDS = 120.0
 MAX_REPLY_BYTES = 32 * 1024
+_RESPONSES_URL = "https://api.openai.com/v1/responses"
+_PLAN_LIMIT_CODE = "subscription_sharing_usage_limit_exceeded"
+_PLAN_NOT_ELIGIBLE_CODE = "subscription_sharing_user_not_eligible"
+_JSON_REPLY_REQUEST = "Reply with one json object, as the instructions describe. The next message is the request."
 
 _RESOURCE_SCHEMA = {
     "type": "object",
@@ -76,22 +86,41 @@ class ProviderError(Exception):
         super().__init__(message)
 
 
+class PlanUsageAuthError(ProviderError):
+    """OpenAI no longer accepts the ChatGPT sign-in; the caller should forget it."""
+
+
+@dataclass(frozen=True)
+class PlanUsage:
+    """A ChatGPT plan access token and the models that account may call."""
+
+    token: str = field(repr=False)
+    models: tuple[str, ...]
+
+
 def complete_plan(
     provider: str,
     model: str | None,
     api_key: str | None,
     prompt: str,
     *,
+    plan_usage: PlanUsage | None = None,
     client: httpx.Client | None = None,
 ) -> str:
     """Ask one allowlisted model for a raw JSON string."""
     choices = MODEL_CHOICES.get(provider)
     if choices is None:
         raise ProviderError("Choose the built-in planner, OpenAI, or Claude.")
+    secret = api_key.strip() if isinstance(api_key, str) else ""
+    # A typed key wins. The plan's own model list is its allowlist.
+    plan = plan_usage if provider == "openai" and secret == "" else None
+    if plan is not None:
+        choices = plan.models
     if not isinstance(model, str) or model not in choices:
         raise ProviderError("Choose one of the listed models.")
-    secret = api_key.strip() if isinstance(api_key, str) else ""
-    if secret == "":
+    if secret == "" and plan is None:
+        if provider == "openai":
+            raise ProviderError("Enter an API key or sign in with ChatGPT. The key is not stored.")
         raise ProviderError("Enter an API key. The key is not stored.")
 
     try:
@@ -102,7 +131,9 @@ def complete_plan(
     owns_client = client is None
     http = client if client is not None else httpx.Client(timeout=_TIMEOUT_SECONDS)
     try:
-        if provider == "openai":
+        if plan is not None:
+            text = _openai_plan_usage(http, model, plan.token, prompt, brief)
+        elif provider == "openai":
             text = _openai(http, model, secret, prompt, brief)
         else:
             text = _claude(http, model, secret, prompt, brief)
@@ -198,6 +229,104 @@ def _openai(http: httpx.Client, model: str, api_key: str, prompt: str, brief: st
     )
     payload = _json_body(response, api_key)
     return _text_from_openai(payload, api_key)
+
+
+def _openai_plan_usage(http: httpx.Client, model: str, token: str, prompt: str, brief: str) -> str:
+    """Call the Responses API on the person's ChatGPT plan.
+
+    The plan route requires ``stream`` and ``store: false``, takes the brief as
+    ``instructions``, and rejects sampling and output-length settings. JSON mode
+    also needs the word "json" in an input message; ``instructions`` does not
+    count, so a fixed message asks for it and the request stays its own message.
+    """
+    with http.stream(
+        "POST",
+        _RESPONSES_URL,
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "model": model,
+            "instructions": brief,
+            "input": [
+                {"role": "user", "content": _JSON_REPLY_REQUEST},
+                {"role": "user", "content": prompt},
+            ],
+            "text": {"format": {"type": "json_object"}},
+            "stream": True,
+            "store": False,
+        },
+    ) as response:
+        if response.status_code >= 400:
+            response.read()
+            raise _plan_usage_error(response, token)
+        return _text_from_stream(response.iter_lines(), token)
+
+
+def _plan_usage_error(response: httpx.Response, token: str) -> ProviderError:
+    code = None
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        code = error.get("code") if isinstance(error, dict) else payload.get("code")
+    if response.status_code == 401:
+        return PlanUsageAuthError("OpenAI no longer accepts the ChatGPT sign-in. Sign in with ChatGPT again.")
+    if code == _PLAN_LIMIT_CODE or response.status_code == 429:
+        return ProviderError("Your ChatGPT plan's usage limit for this app was reached. Nothing was stored.")
+    if code == _PLAN_NOT_ELIGIBLE_CODE:
+        return ProviderError(
+            "This ChatGPT account cannot use its plan here. Plus or Pro is required. "
+            "Use an OpenAI API key instead."
+        )
+    detail = _redact(response.text[:180], token)
+    return ProviderError(f"The model provider returned HTTP {response.status_code}. {detail}")
+
+
+def _text_from_stream(lines: Iterable[str], token: str) -> str:
+    """Join streamed output text. Only a ``response.completed`` event ends it well."""
+    parts: list[str] = []
+    size = 0
+    for line in lines:
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:") :].strip()
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise ProviderError("The model provider sent an unreadable stream event.") from exc
+        if not isinstance(event, dict):
+            raise ProviderError("The model provider sent an unreadable stream event.")
+        kind = event.get("type")
+        if kind == "response.output_text.delta":
+            delta = event.get("delta")
+            if not isinstance(delta, str):
+                raise ProviderError("The model provider sent an unreadable stream event.")
+            size += len(delta.encode("utf-8"))
+            if size > MAX_REPLY_BYTES:
+                raise ProviderError("The model reply was larger than 32 KB and was not stored.")
+            parts.append(delta)
+        elif isinstance(kind, str) and kind.startswith("response.refusal."):
+            raise ProviderError("The model declined this request. Nothing was stored.")
+        elif kind == "response.incomplete":
+            raise ProviderError("The model reply was cut off before it finished. Nothing was stored.")
+        elif kind in ("response.failed", "error"):
+            raise ProviderError(f"The model provider reported a failed response. {_stream_error(event, token)}")
+        elif kind == "response.completed":
+            text = "".join(parts)
+            if text.strip() == "":
+                raise ProviderError("The model provider returned no text.")
+            return _redact(text, token)
+    raise ProviderError("The model reply ended before it finished. Nothing was stored.")
+
+
+def _stream_error(event: Mapping[str, object], token: str) -> str:
+    error = event.get("error")
+    response = event.get("response")
+    if not isinstance(error, dict) and isinstance(response, dict):
+        error = response.get("error")
+    message = error.get("message") if isinstance(error, dict) else event.get("message")
+    return _redact(message[:180], token) if isinstance(message, str) else ""
 
 
 def _claude(http: httpx.Client, model: str, api_key: str, prompt: str, brief: str) -> str:
