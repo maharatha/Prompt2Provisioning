@@ -1,0 +1,13 @@
+{
+  "container": {
+    "container-small": "18",
+    "container-medium": "42"
+  },
+  "postgres": {
+    "db-small": "35",
+    "db-medium": "95"
+  },
+  "object_storage": {
+    "storage-standard": "0.025"
+  }
+}
