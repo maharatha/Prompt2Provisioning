@@ -1161,6 +1161,38 @@ def test_callback_with_a_bad_state_shows_an_escaped_error_page(api) -> None:
     assert "<script>" not in denied.text
 
 
+def test_access_log_hides_the_sign_in_code_and_state() -> None:
+    access = logging.getLogger("uvicorn.access")
+    record = access.makeRecord(
+        "uvicorn.access",
+        logging.INFO,
+        __file__,
+        1,
+        '%s - "%s %s HTTP/%s" %d',
+        ("127.0.0.1:5000", "GET", "/callback?code=ac_secret&state=s&client_id=c", "1.1", 400),
+        None,
+    )
+    assert all(item.filter(record) for item in access.filters)
+    message = record.getMessage()
+    assert "ac_secret" not in message
+    assert '"GET /callback?[redacted] HTTP/1.1" 400' in message
+
+    other = access.makeRecord(
+        "uvicorn.access", logging.INFO, __file__, 1, "%s %s %s %s %d",
+        ("127.0.0.1:5000", "GET", "/v1/plans?x=1", "1.1", 200), None,
+    )
+    assert all(item.filter(other) for item in access.filters)
+    assert "/v1/plans?x=1" in other.getMessage()
+
+
+def test_refused_sign_in_logs_why(api, caplog: pytest.LogCaptureFixture) -> None:
+    client, _store, _service = api
+    caplog.set_level(logging.INFO, logger="app")
+    client.get("/callback", params={"code": "ac_secret", "state": "wrong", "client_id": "x"})
+    assert "chatgpt sign-in refused reason=No sign-in is waiting" in caplog.text
+    assert "ac_secret" not in caplog.text
+
+
 def test_schema_endpoint_matches_proposed_plan_schema(api) -> None:
     client, _store, _service = api
     response = client.get("/v1/schema/plan")

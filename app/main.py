@@ -37,11 +37,29 @@ def configure_logging() -> None:
     They do not include the request body, so an API key in that body is not logged.
     """
     _LOG.setLevel(logging.INFO)
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(item, RedactSignInCallback) for item in access.filters):
+        access.addFilter(RedactSignInCallback())
     if _LOG.handlers:
         return
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     _LOG.addHandler(handler)
+
+
+class RedactSignInCallback(logging.Filter):
+    """Keep the ChatGPT sign-in code and state out of uvicorn's access log.
+
+    Uvicorn logs ``(client, method, path_with_query, http_version, status)``.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5:
+            path = args[2]
+            if isinstance(path, str) and path.split("?", 1)[0] == "/callback" and "?" in path:
+                record.args = (args[0], args[1], "/callback?[redacted]", args[3], args[4])
+        return True
 
 
 configure_logging()
@@ -377,7 +395,8 @@ async def openai_callback(
     try:
         auth.finish(code, state, client_id)
     except SignInError as exc:
-        _LOG.warning("chatgpt sign-in refused")
+        # The messages are fixed text with no code, state, or token in them.
+        _LOG.warning("chatgpt sign-in refused reason=%s", exc.message)
         return _callback_page(exc.message, status_code=400)
     _LOG.info("chatgpt signed in")
     return _callback_page(
