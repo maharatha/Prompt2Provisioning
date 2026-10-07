@@ -91,7 +91,7 @@ Flat layout under `app/`, `ui/`, and `tests/`. No `src/` tree, no domain/infrast
 | FastAPI | HTTP API. |
 | Pydantic v2 | Schema. Generated models use `extra="forbid"`. |
 | Jinja2 | Deterministic HCL. The template is not executed. |
-| Streamlit | UI. Configured with `API_URL` (`http://api:8000` in Compose). |
+| Streamlit | UI. Reads `API_BASE_URL`, default `http://localhost:8000`. Compose sets `API_BASE_URL=http://api:8000`. |
 | pytest and TestClient | Tests. An empty store is injected with `dependency_overrides`. Docker is not required to test. |
 | `requirements.txt` | Runtime dependencies at the repository root. Test-only packages stay in `requirements-dev.txt`. |
 
@@ -173,6 +173,8 @@ These are three different failures. A value can be structurally valid and still 
 
 **Schema.** `Resource` and `ProposedPlan` forbid unknown fields. `quantity` and `capacity_gb` are strict integers in range: booleans, floats (including `2.0`), and numeric strings are invalid. `quantity` is 1–100. `object_storage` requires `capacity_gb > 0`. `container` and `postgres` must omit `capacity_gb`. Region, resource name, SKU, and tag text must be non-blank after trim; the original string is what is stored. Resource type is the enum `container`, `postgres`, or `object_storage`, so an unknown type never reaches policy. SKU is a string of 1–64 non-blank characters, not an enum, so an unknown SKU is representable and pricing can fail closed. Region is a non-blank string; the allowed set is a policy, not a schema enum. Required tag keys are also a policy. The schema only rejects blank tag keys and values.
 
+A validation issue has `code`, `message`, and optional `field_path`. A JSON parse failure produces one issue: `code` is `json_invalid`, `field_path` is null, and `message` is `{JSONDecodeError.msg} at line {lineno} column {colno}`. A schema failure produces one issue per Pydantic error. `code` is that error's `type` string, such as `missing`, `extra_forbidden`, `enum`, `int_type`, `greater_than`, `value_error`, or `model_type`. `message` is the Pydantic `msg` with a leading `Value error, ` removed when present. `field_path` joins the error location with `.`, and each integer index is written as `[n]` on the preceding component (`resources[0].sku`). An empty location leaves `field_path` null.
+
 **Policy.** Each policy is `ProposedPlan -> list[PolicyResult]` and does not mutate the plan. A result carries `policy_id`, `status` (`passed`, `warning`, `error`), `message`, and optional `resource_name` and `field_path`. A policy with nothing to report still emits one `passed` row so the review always lists every policy.
 
 | policy_id | Rule | On violation |
@@ -200,7 +202,15 @@ The example request prices to `71.00` (`2 * 18 + 35`). Adding 100 GB of `storage
 
 ## Artifacts
 
-Rendering sorts resources and tags stably, so two renders of the same plan are identical. Every user-influenced string is escaped. The document uses `demo_*` resources only and includes a prominent comment that nothing was deployed. The application never invokes Terraform or a cloud provider.
+Rendering does not change the stored proposal or its hash. The document uses `demo_*` resources only and starts with a comment that this is a prototype dry-run and nothing was deployed. The application never invokes Terraform or a cloud provider.
+
+Tags are sorted by key, ascending, using Python's default string order. Resources are sorted by this tuple, independent of the proposal list order used for the hash:
+
+`(type, name, sku, quantity, capacity_gb is not None, 0 if capacity_gb is None else capacity_gb, public_access)`
+
+A missing capacity sorts before any stored size because `False` sorts before `True`. `public_access` false sorts before true. Type names sort lexicographically, so `container` comes before `object_storage`, which comes before `postgres`. After sorting, labels are assigned per type as `container_0`, `postgres_0`, `object_storage_0`, and so on. The label is not derived from the resource name. Block types are `demo_container`, `demo_postgres`, and `demo_object_storage`.
+
+Region, environment, tag keys, tag values, resource names, and SKUs are user-influenced strings. Each is wrapped in double quotes. The escape function writes `\\` for backslash, `\"` for a quote, and `\n`, `\r`, and `\t` for newline, carriage return, and tab. Code points below U+0020, plus U+007F and U+0080 through U+009F, are written as `\u` and four lowercase hexadecimal digits. Every other character, including non-ASCII text, is copied unchanged. After that character pass, `${` is replaced with `$${` and `%{` with `%%{` so Terraform does not interpolate them. Jinja autoescape is off because the strings are escaped in Python before the template runs. `count`, `capacity_gb`, and `public_access` are not quoted user strings: counts and capacities are integers, and public access is the literal `true` or `false`.
 
 ## API
 
@@ -258,7 +268,9 @@ Resolved by the API routes:
 - **Decimal encoding.** The API serializes `Decimal` money through Pydantic JSON as strings and does not convert money to float. The route does not quantize amounts; `Decimal("71")` is `"71"` and `Decimal("73.500")` is `"73.500"`.
 - **Health payload.** `GET /health` returns `{ "status": "ok", "service": "prompt-to-provisioning-planner" }`.
 
-Still open:
+Resolved by validation and artifact rendering:
 
-- **Validation issue codes.** A validation issue has `code`, `message`, and optional `field_path`. The `code` values for a JSON parse failure versus a schema failure are not specified.
-- **HCL ordering and escaping.** Output must be stable and user-influenced strings must be escaped. The sort key and the escape function are not specified.
+- **Validation issue codes.** A JSON parse failure uses `code` `json_invalid` and a null `field_path`. A schema failure uses the Pydantic error `type` as `code`. Messages and `field_path` are specified under Schema.
+- **HCL ordering and escaping.** Resources sort by `(type, name, sku, quantity, capacity_gb is not None, capacity or 0, public_access)`. Tags sort by key. The escape function and block labels are specified under Artifacts.
+
+No open decisions remain for this prototype.

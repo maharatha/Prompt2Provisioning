@@ -278,7 +278,7 @@ Plan routes return `PlanRecord`: `id`, `prompt`, `raw_output`, `status`, `propos
 - Approve sends the **stored** `plan_hash` from the last GET/POST response. Reject sends the plan id only.
 - Disable approve when the record has validation errors, a policy `error`, or pricing that did not succeed.
 - Generate artifact and download `main.tf` only after approval. The file body is the plan record's `artifact` field.
-- Configure API base URL via environment (Compose: `API_URL=http://api:8000`).
+- Configure API base URL via environment variable `API_BASE_URL` (default `http://localhost:8000`; Compose: `API_BASE_URL=http://api:8000`).
 
 ## Testing
 
@@ -314,7 +314,7 @@ Do not proceed past a failing test without explaining or correcting it. Do not c
 
 ## Docker and local run
 
-Compose services: `api` (uvicorn `app.main:app --host 0.0.0.0 --port 8000`) and `ui` (Streamlit port 8501) with `API_URL=http://api:8000`.
+Compose services: `api` (uvicorn `app.main:app --host 0.0.0.0 --port 8000`) and `ui` (Streamlit port 8501) with `API_BASE_URL=http://api:8000`.
 
 Local without Docker:
 
