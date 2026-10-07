@@ -1,0 +1,41 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Pytest and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Environment files (keep the example)
+.env
+.env.*
+!.env.example
+
+# Generated artifacts
+artifacts/
+*.tf
+!app/templates/*.tf.j2
+
+# Cursor and IDE
+.cursor/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating-system temporary files
+.DS_Store
+Thumbs.db
+Desktop.ini
