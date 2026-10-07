@@ -15,12 +15,24 @@ from streamlit.testing.v1 import AppTest
 
 from ui.app import (
     EXAMPLE_PROMPT,
+    LIVE_PROMPT_SCRIPT,
+    MAX_PROMPT_CHARS,
+    OUTCOME_GROUPS,
     PLAN_RECORD_KEY,
     REQUEST_TIMEOUT,
     SCENARIO_TOKENS,
+    SUGGESTED_PROMPTS,
+    busy_overlay_html,
+    defaults_html,
     format_usd,
+    live_prompt_installer_html,
+    formatted_json,
     parse_decimal_string,
+    plan_verdict,
+    prompt_length_html,
+    prompt_ready,
     submitted_prompt,
+    verdict_html,
 )
 
 APP_PATH = Path(__file__).resolve().parents[1] / "ui" / "app.py"
@@ -242,15 +254,328 @@ def test_money_uses_decimal_strings() -> None:
             parse_decimal_string(value)
 
 
-def test_submitted_prompt_adds_the_selected_scenario_token() -> None:
+@pytest.mark.parametrize("provider", ["OpenAI", "Anthropic"])
+def test_recognized_words_show_only_for_the_built_in_planner(planner: AppTest, provider: str) -> None:
+    assert "Recognized words:" in _page_text(planner)
+    assert "Any wording." not in _page_text(planner)
+
+    planner.selectbox(key="planner_provider").set_value(provider).run()
+    _assert_ran(planner)
+    text = _page_text(planner)
+    assert "Recognized words:" not in text
+    assert "Any wording." in text
+    assert "same schema, policies, and synthetic prices" in text
+
+
+def test_interpretation_notes_show_as_plain_text(planner: AppTest) -> None:
+    note = "container: the model added 1 × [click](http://evil.example); the request may not ask for it."
+    _show(planner, _record(generator="openai:gpt-5", interpretation_notes=[note]))
+    assert "Does the plan match the request?" in _page_text(planner)
+    assert f"• {note}" in [element.value for element in planner.text]
+    assert not any("evil.example" in element.value for element in planner.markdown)
+    assert _disabled(planner, "approve") is False
+
+
+def test_no_interpretation_panel_without_notes(planner: AppTest) -> None:
+    _show(planner, _record())
+    assert "Does the plan match the request?" not in _page_text(planner)
+
+
+@pytest.mark.parametrize(
+    ("label", "prompt", "outcome", "look_for"),
+    SUGGESTED_PROMPTS,
+    ids=[item[0] for item in SUGGESTED_PROMPTS],
+)
+def test_each_example_does_what_its_caption_says(
+    label: str, prompt: str, outcome: str, look_for: str
+) -> None:
+    import re
+
+    from app.services import PlanService
+    from app.store import InMemoryStore
+
+    assert outcome in {key for key, _heading in OUTCOME_GROUPS}
+    assert len(prompt) <= MAX_PROMPT_CHARS
+    record = PlanService(InMemoryStore()).create_plan(prompt)
+    statuses = {check.status.value for check in record.policy_checks}
+
+    if outcome in {"draft", "model"}:
+        assert record.status.value == "draft", label
+        assert record.validation_errors
+        return
+    assert record.status.value == "evaluated", label
+    assert record.cost is not None and record.cost.succeeded
+    if outcome == "approvable":
+        assert statuses == {"passed"}, label
+    elif outcome == "warning":
+        assert "warning" in statuses and "error" not in statuses, label
+    else:
+        assert "error" in statuses, label
+    stated = re.search(r"USD (\d+\.\d{2})", look_for)
+    if stated:
+        assert Decimal(stated.group(1)) == record.cost.monthly_total.quantize(Decimal("0.01")), label
+
+
+def test_every_outcome_group_has_an_example() -> None:
+    used = {item[2] for item in SUGGESTED_PROMPTS}
+    assert used == {key for key, _heading in OUTCOME_GROUPS}
+
+
+def test_choosing_an_example_fills_the_request_and_clears_the_scenario(planner: AppTest) -> None:
+    planner.selectbox(key="scenario").set_value("malformed").run()
+    target = next(index for index, item in enumerate(SUGGESTED_PROMPTS) if item[2] == "policy_error")
+    planner.button(key=f"suggest_{target}").click().run()
+    _assert_ran(planner)
+    assert planner.text_area(key="prompt_text").value == SUGGESTED_PROMPTS[target][1]
+    assert planner.selectbox(key="scenario").value == "None"
+    text = _page_text(planner)
+    assert "Blocked by a policy" in text
+    assert SUGGESTED_PROMPTS[target][3] in text
+
+
+_DRAFT = {
+    "status": "draft",
+    "proposed": None,
+    "plan_hash": None,
+    "policy_checks": [],
+    "cost": None,
+    "validation_errors": [
+        {"code": "unrecognized_input", "message": "No recognized resource.", "field_path": "resources"}
+    ],
+}
+
+
+def test_verdict_for_a_draft_is_a_failure_listing_each_error() -> None:
+    kind, title, detail, reasons = plan_verdict(_record(**_DRAFT))
+    assert (kind, title) == ("fail", "Not a valid plan")
+    assert "cannot be approved" in detail
+    assert reasons == ["Validation error: unrecognized_input at resources: No recognized resource."]
+
+
+def test_verdict_for_policy_and_pricing_failures_is_blocked() -> None:
+    policy = _record(policy_checks=[_policy("storage_public", "error", "Bucket is public.")])
+    kind, title, _detail, reasons = plan_verdict(policy)
+    assert (kind, title) == ("fail", "Blocked: cannot be approved")
+    assert reasons == ["storage_public: Bucket is public."]
+
+    pricing = _record(
+        cost={"succeeded": False, "monthly_total": "0", "line_items": [], "pricing_errors": ["unknown SKU"]}
+    )
+    assert plan_verdict(pricing)[3] == ["Pricing: unknown SKU"]
+
+
+def test_verdict_for_warnings_and_clean_plans() -> None:
+    warned = _record(policy_checks=[_policy("dev_medium_cost", "warning", "Medium SKU in dev.")])
+    kind, title, detail, reasons = plan_verdict(warned)
+    assert (kind, title) == ("warn", "Approvable with 1 warning")
+    assert reasons == ["dev_medium_cost: Medium SKU in dev."]
+    assert "USD 71.00" in detail
+
+    assert plan_verdict(_record())[:2] == ("pass", "Ready for approval")
+    assert plan_verdict(_record(status="approved"))[:2] == ("pass", "Approved")
+    assert plan_verdict(_record(status="rejected"))[0] == "rejected"
+    assert plan_verdict(None) is None
+
+
+_DEFAULTS = [
+    "Region: the request names none, so the plan uses us-east-1.",
+    "Environment: the request names none, so the plan uses dev.",
+]
+
+
+def test_defaults_panel_lists_each_default_and_the_banner_counts_them(planner: AppTest) -> None:
+    _show(planner, _record(defaults_applied=_DEFAULTS))
+    markdown = "\n".join(element.value for element in planner.markdown)
+    assert 'class="p2p-defaults"' in markdown
+    assert "Defaults the plan used (2)" in markdown
+    for note in _DEFAULTS:
+        assert f"<li>{note}</li>" in markdown
+    assert "Uses 2 defaults you did not specify; see the list below." in markdown
+
+
+def test_no_defaults_panel_when_nothing_was_defaulted(planner: AppTest) -> None:
+    _show(planner, _record())
+    markdown = "\n".join(element.value for element in planner.markdown)
+    assert 'class="p2p-defaults"' not in markdown
+    assert "did not specify" not in markdown
+
+
+def test_defaults_html_escapes_model_text() -> None:
+    assert "&lt;b&gt;" in defaults_html(["Region: <b>x</b>"])
+    assert "<b>" not in defaults_html(["Region: <b>x</b>"])
+
+
+def test_verdict_html_escapes_model_text() -> None:
+    html_text = verdict_html(("fail", "Blocked", "detail", ["sku: <img src=x onerror=alert(1)>"]))
+    assert "<img" not in html_text
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html_text
+
+
+def test_draft_shows_a_red_banner_and_a_failed_review_step(planner: AppTest) -> None:
+    _show(planner, _record(**_DRAFT))
+    markdown = "\n".join(element.value for element in planner.markdown)
+    assert 'class="p2p-verdict fail"' in markdown
+    assert "Not a valid plan" in markdown
+    assert "No recognized resource." in markdown
+    assert 'class="p2p-step failed"' in markdown
+    assert "Failed validation" in markdown
+    assert 'class="p2p-pill fail">Status: draft' in markdown
+    # A short copy sits under Generate plan, so the result is visible without scrolling.
+    assert markdown.count('class="p2p-verdict fail"') == 2
+    assert "1 finding. Details are in 2 Review below." in markdown
+
+
+def test_clean_plan_shows_a_green_banner_and_no_failed_step(planner: AppTest) -> None:
+    _show(planner, _record())
+    markdown = "\n".join(element.value for element in planner.markdown)
+    assert 'class="p2p-verdict pass"' in markdown
+    assert "Ready for approval" in markdown
+    assert "p2p-step failed" not in markdown
+
+
+COMPACT_MODEL_OUTPUT = (
+    '{"region":"us-east-1","environment":"dev","tags":{"owner":"dev-team"},'
+    '"resources":[{"type":"postgres","name":"db","sku":"db-small","quantity":1,"public_access":false}]}'
+)
+
+
+def test_formatted_json_indents_compact_output_without_changing_values() -> None:
+    formatted = formatted_json(COMPACT_MODEL_OUTPUT)
+    assert formatted is not None
+    assert formatted.splitlines()[:3] == ["{", '  "region": "us-east-1",', '  "environment": "dev",']
+    assert json.loads(formatted) == json.loads(COMPACT_MODEL_OUTPUT)
+    assert list(json.loads(formatted)) == ["region", "environment", "tags", "resources"]
+    assert formatted_json('{"note":"café ✓"}') == '{\n  "note": "café ✓"\n}'
+
+
+@pytest.mark.parametrize("raw", ["{ truncated", "NEW_RAW_OUTPUT", "", '{"a": 1} trailing'])
+def test_formatted_json_is_none_for_text_that_is_not_json(raw: str) -> None:
+    assert formatted_json(raw) is None
+
+
+def test_model_output_shows_formatted_and_exact_tabs(planner: AppTest) -> None:
+    _show(planner, _record(raw_output=COMPACT_MODEL_OUTPUT, generator="openai:gpt-5"))
+    code_values = [block.value for block in planner.code]
+    assert formatted_json(COMPACT_MODEL_OUTPUT) in code_values
+    assert COMPACT_MODEL_OUTPUT in code_values
+    assert [tab.label for tab in planner.tabs] == ["Formatted", "Exact text as stored"]
+    assert "the stored text is unchanged" in _page_text(planner)
+
+
+def test_invalid_output_is_shown_exactly_without_tabs(planner: AppTest) -> None:
+    _show(planner, _record(**{**_DRAFT, "raw_output": "{ truncated"}))
+    assert "{ truncated" in [block.value for block in planner.code]
+    assert list(planner.tabs) == []
+    assert "Not valid JSON" in _page_text(planner)
+
+
+@pytest.mark.parametrize(
+    ("text", "planner_choice", "scenario", "ready"),
+    [
+        ("x" * 30, "Built-in", "None", True),
+        ("  " + "x" * 29 + "  ", "Built-in", "None", False),
+        ("", "Built-in", "malformed", True),
+        ("", "OpenAI", "malformed", False),
+        ("x" * 30, "Anthropic", "None", True),
+        (None, "Built-in", "None", False),
+    ],
+)
+def test_prompt_ready(text: object, planner_choice: str, scenario: str, ready: bool) -> None:
+    assert prompt_ready(text, planner=planner_choice, scenario=scenario) is ready
+
+
+def test_prompt_length_message_names_the_minimum_and_the_gap() -> None:
+    assert "✓ 30 characters (minimum 30)" in prompt_length_html("x" * 30)
+    short = prompt_length_html("two containers")
+    assert "✗ 14 of 30 characters. Add 16 more" in short
+    assert "Ctrl+Enter" in short
+
+
+def test_short_request_shows_the_count_and_a_click_is_refused(planner: AppTest) -> None:
+    from unittest.mock import patch
+
+    assert planner.button(key="generate").proto.type == "primary"
+    planner.text_area(key="prompt_text").set_value("two containers").run()
+    _assert_ran(planner)
+    markdown = "\n".join(element.value for element in planner.markdown)
+    assert 'data-p2p-mode="length">✗ 14 of 30 characters' in markdown
+
+    # The in-page script disables the button while typing; the server is the backstop.
+    with patch("requests.request") as request:
+        planner.button(key="generate").click().run()
+    assert request.call_count == 0
+    assert any("at least 30 characters" in element.value for element in planner.error)
+
+    planner.text_area(key="prompt_text").set_value("two web containers in US East, prod").run()
+    assert "✓ 35 characters" in "\n".join(element.value for element in planner.markdown)
+
+
+def test_scenario_marks_the_count_line_so_the_script_enables_generate(planner: AppTest) -> None:
+    planner.text_area(key="prompt_text").set_value("").run()
+    planner.selectbox(key="scenario").set_value("malformed").run()
+    markdown = "\n".join(element.value for element in planner.markdown)
+    assert 'data-p2p-mode="scenario">Scenario selected: the request text is not sent.' in markdown
+    request = _click(planner, "generate", _response(201, _record()))
+    assert request.call_args.kwargs["json"]["prompt"] == "SCENARIO:malformed"
+
+
+def test_live_prompt_script_targets_the_box_and_button_and_uses_the_minimum() -> None:
+    assert ".st-key-prompt_text textarea" in LIVE_PROMPT_SCRIPT
+    assert ".st-key-generate button" in LIVE_PROMPT_SCRIPT
+    assert "const MIN = 30;" in LIVE_PROMPT_SCRIPT
+    assert "MutationObserver" in LIVE_PROMPT_SCRIPT
+    installer = live_prompt_installer_html()
+    assert "window.parent.document" in installer
+    assert "p2p-live-prompt" in installer
+    # The script is embedded as a JSON string, so it cannot close the <script> tag early.
+    assert "</script>" not in installer[: installer.rindex("</script>")]
+
+
+def test_busy_overlay_is_centred_full_screen_and_escaped() -> None:
+    overlay = busy_overlay_html("Waiting for <OpenAI>…", "Up to a minute.")
+    assert "position:fixed;inset:0" in overlay
+    assert "justify-content:center" in overlay
+    assert "animation:p2p-spin" in overlay
+    assert "&lt;OpenAI&gt;" in overlay and "<OpenAI>" not in overlay
+
+
+def test_overlay_is_removed_after_the_plan_arrives(planner: AppTest) -> None:
+    request = _click(planner, "generate", _response(201, _record()))
+    assert request.call_count == 1
+    assert not any("p2p-busy" in element.value for element in planner.markdown)
+
+
+def test_submitted_prompt_sends_only_the_selected_scenario_token() -> None:
     assert submitted_prompt(ASSIGNMENT_EXAMPLE, "None") == ASSIGNMENT_EXAMPLE
-    assert submitted_prompt(ASSIGNMENT_EXAMPLE, "malformed") == (
-        f"SCENARIO:malformed\n{ASSIGNMENT_EXAMPLE}"
-    )
+    assert submitted_prompt(ASSIGNMENT_EXAMPLE, "malformed") == "SCENARIO:malformed"
     assert submitted_prompt("  ", "public_storage") == "SCENARIO:public_storage"
-    assert submitted_prompt("SCENARIO:missing_tags\nalready", "missing_tags") == (
-        "SCENARIO:missing_tags\nalready"
-    )
+    assert submitted_prompt("x" * 5000, "extra_fields") == "SCENARIO:extra_fields"
+    assert submitted_prompt("SCENARIO:missing_tags\nalready", "bad_region") == "SCENARIO:bad_region"
+
+
+def test_scenario_selector_shows_only_for_the_built_in_planner(planner: AppTest) -> None:
+    assert "scenario" in [box.key for box in planner.selectbox]
+    assert set(SCENARIO_TOKENS) >= {"extra_fields", "bad_region"}
+    for provider in ("OpenAI", "Anthropic"):
+        planner.selectbox(key="planner_provider").set_value(provider).run()
+        _assert_ran(planner)
+        assert "scenario" not in [box.key for box in planner.selectbox]
+        assert "Scenarios apply to the built-in planner" not in _page_text(planner)
+    planner.selectbox(key="planner_provider").set_value("Built-in").run()
+    _assert_ran(planner)
+    assert "scenario" in [box.key for box in planner.selectbox]
+
+
+def test_model_planner_ignores_a_previously_chosen_scenario(planner: AppTest) -> None:
+    from unittest.mock import patch
+
+    planner.selectbox(key="scenario").set_value("malformed").run()
+    planner.selectbox(key="planner_provider").set_value("OpenAI").run()
+    planner.text_input(key="openai_api_key").set_value("sk-test").run()
+    with patch("requests.request", return_value=_response(201, _record())) as request:
+        planner.button(key="generate").click().run()
+    _assert_ran(planner)
+    assert request.call_args.kwargs["json"]["prompt"] == ASSIGNMENT_EXAMPLE
 
 
 def test_initial_page_shows_the_prototype_notice_and_example(planner: AppTest) -> None:
@@ -260,7 +585,7 @@ def test_initial_page_shows_the_prototype_notice_and_example(planner: AppTest) -
     assert "synthetic" in text.lower()
     assert "Nothing was deployed." in text
     assert "not saved on the plan" in text
-    assert "not the person who accepts" in text
+    assert "The same person writes the sentence and decides." in text
     assert planner.selectbox(key="planner_provider").value == "Built-in"
     assert planner.text_area[0].value == ASSIGNMENT_EXAMPLE
     assert EXAMPLE_PROMPT == ASSIGNMENT_EXAMPLE
@@ -642,7 +967,8 @@ def test_float_money_is_rejected_and_the_record_is_preserved(planner: AppTest) -
     assert "decimal string" in text
     assert "not retried" in text
     assert "Monthly total: USD 35.00" in text
-    assert "USD 71.00" not in text
+    # The example captions mention USD 71.00; the rejected total must not be shown as the plan's.
+    assert "Monthly total: USD 71.00" not in text
     assert OLD_ARTIFACT in [block.value for block in planner.code]
 
 
@@ -687,12 +1013,12 @@ def test_conflict_shows_the_error_and_refresh_does_not_resubmit_approval(
     assert "hash_mismatch" not in _page_text(planner)
 
 
-def test_scenario_token_is_sent_with_the_prompt(planner: AppTest) -> None:
+def test_scenario_token_is_sent_without_the_prompt_text(planner: AppTest) -> None:
     planner.selectbox(key="scenario").set_value("public_storage")
     request = _click(planner, "generate", _response(201, _record()))
 
     posted = request.call_args.kwargs["json"]["prompt"]
-    assert posted == f"SCENARIO:public_storage\n{ASSIGNMENT_EXAMPLE}"
+    assert posted == "SCENARIO:public_storage"
 
 
 def test_api_base_url_defaults_to_localhost(monkeypatch: pytest.MonkeyPatch) -> None:

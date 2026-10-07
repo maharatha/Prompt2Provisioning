@@ -9,12 +9,15 @@ stored only after rendering succeeds.
 """
 
 import hmac
+import json
+from collections.abc import Iterable, Mapping
+from typing import Any
 from uuid import UUID
 
 from app.artifacts import render_artifact
 from app.hashing import canonical_hash
 from app.models import CheckStatus, PlanRecord, PlanStatus, ProposedPlan
-from app.planner import MockPlanner, Planner
+from app.planner import MockPlanner, Planner, stated_details
 from app.policies import evaluate_policies
 from app.pricing import estimate_cost
 from app.store import InMemoryStore
@@ -92,8 +95,25 @@ class PlanService:
                 plan_hash=canonical_hash(proposed),
                 policy_checks=evaluate_policies(proposed),
                 cost=estimate_cost(proposed),
+                interpretation_notes=(
+                    self._planner_readings(prompt)
+                    if generator == "mock"
+                    else interpretation_notes(prompt, proposed)
+                ),
+                defaults_applied=defaults_applied(
+                    prompt, proposed, built_in=generator == "mock"
+                ),
             )
         )
+
+    def _planner_readings(self, prompt: str) -> list[str]:
+        """Synonym, typo, and quantity rewrites the built-in planner applied.
+
+        A planner without ``explain`` reports none. The readings are shown to
+        the reviewer; they are not policy and not part of the hash.
+        """
+        explain = getattr(self._planner, "explain", None)
+        return list(explain(prompt)) if callable(explain) else []
 
     def list_decisions(self) -> list[PlanRecord]:
         """Return approved, rejected, and artifact plans, newest first.
@@ -316,6 +336,119 @@ def _render_artifact(proposed: ProposedPlan) -> str:
             "artifact_render",
             "The approved plan could not be rendered.",
         ) from exc
+
+
+_RESOURCE_ORDER = ("postgres", "mysql", "container", "object_storage")
+_MATCHES_NOTE = "Matches the built-in planner's reading of the request."
+_NOT_COMPARED_NOTE = (
+    "Not compared: the built-in planner could not read this request. "
+    "Check the plan against the request yourself."
+)
+
+
+def interpretation_notes(prompt: str, proposed: ProposedPlan) -> list[str]:
+    """Compare a model plan with the built-in planner's reading of the same prompt.
+
+    The notes are hints for the reviewer. They are not policy results, they do
+    not block approval, and they do not change the plan or its hash. The
+    built-in vocabulary is narrow, so a difference means "check this line", not
+    "the model is wrong".
+    """
+    if "SCENARIO:" in prompt:
+        return [_NOT_COMPARED_NOTE]
+    reference = json.loads(MockPlanner().generate(prompt))
+    if "interpretation_error" in reference:
+        return [_NOT_COMPARED_NOTE]
+
+    notes: list[str] = []
+    if proposed.region != reference["region"]:
+        notes.append(
+            f"Region: the model chose {proposed.region}; "
+            f"the built-in reading is {reference['region']}."
+        )
+    if proposed.environment.value != reference["environment"]:
+        notes.append(
+            f"Environment: the model chose {proposed.environment.value}; "
+            f"the built-in reading is {reference['environment']}."
+        )
+    model_lines = _resource_lines(resource.model_dump(mode="json") for resource in proposed.resources)
+    reference_lines = _resource_lines(reference["resources"])
+    for kind in _RESOURCE_ORDER:
+        model_line = model_lines.get(kind)
+        reference_line = reference_lines.get(kind)
+        if model_line == reference_line:
+            continue
+        if reference_line is None:
+            notes.append(f"{kind}: the model added {model_line}; the request may not ask for it.")
+        elif model_line is None:
+            notes.append(f"{kind}: the model left out {reference_line}, which the built-in reading found.")
+        else:
+            notes.append(
+                f"{kind}: the model has {model_line}; the built-in reading has {reference_line}."
+            )
+    return notes or [_MATCHES_NOTE]
+
+
+def defaults_applied(prompt: str, proposed: ProposedPlan, *, built_in: bool) -> list[str]:
+    """List each value in ``proposed`` that the request did not state.
+
+    What the request states is read with the built-in vocabulary
+    (``stated_details``), for every planner. A model may fill the same gaps, so
+    its plans get the same call-outs. These are reviewer notes: not policy, not
+    an approval gate, and not part of the hash.
+    """
+    stated = stated_details(prompt)
+    if stated is None:
+        return []
+    notes: list[str] = []
+    if not stated.region:
+        notes.append(f"Region: the request names none, so the plan uses {proposed.region}.")
+    if not stated.environment:
+        notes.append(
+            f"Environment: the request names none, so the plan uses {proposed.environment.value}."
+        )
+    for resource in proposed.resources:
+        kind = resource.type.value
+        if kind not in stated.mentioned:
+            continue
+        if kind == "object_storage":
+            if kind not in stated.with_capacity and resource.capacity_gb is not None:
+                notes.append(
+                    f"Capacity: none given for {resource.name} ({kind}), "
+                    f"so it uses {resource.capacity_gb} GB."
+                )
+        elif kind not in stated.sized:
+            tier = ", the smallest tier" if resource.sku.endswith("-small") else ""
+            notes.append(
+                f"Size: none given for {resource.name} ({kind}), so it uses {resource.sku}{tier}."
+            )
+    for tag, named, noun in (
+        ("owner", stated.owner, "an owner"),
+        ("cost-center", stated.cost_center, "a cost center"),
+    ):
+        value = proposed.tags.get(tag)
+        if value is None:
+            continue
+        if not named:
+            notes.append(f"Tag {tag}: none named, so the plan uses {value}.")
+        elif built_in:
+            # The built-in planner always writes fixed tag values.
+            notes.append(
+                f"Tag {tag}: the request names {noun}, but the built-in planner does not read "
+                f"{tag}s, so the plan uses {value}."
+            )
+    return notes
+
+
+def _resource_lines(resources: Iterable[Mapping[str, Any]]) -> dict[str, str]:
+    """Describe each resource type as ``N × sku`` (plus GB for storage)."""
+    parts: dict[str, list[str]] = {}
+    for resource in resources:
+        text = f"{resource['quantity']} × {resource['sku']}"
+        if resource.get("capacity_gb") is not None:
+            text += f" ({resource['capacity_gb']} GB)"
+        parts.setdefault(str(resource["type"]), []).append(text)
+    return {kind: " + ".join(items) for kind, items in parts.items()}
 
 
 def _hashes_equal(left: str, right: str) -> bool:

@@ -1,4 +1,6 @@
+import json
 import logging
+import re
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -207,7 +209,7 @@ def test_malformed_planner_output_is_a_draft(api) -> None:
 
 @pytest.mark.parametrize(
     "prompt",
-    ["SCENARIO:missing_region", "SCENARIO:unknown_type"],
+    ["SCENARIO:missing_region", "SCENARIO:unknown_type", "SCENARIO:extra_fields"],
 )
 def test_schema_failures_cannot_be_approved(api, prompt: str) -> None:
     client, _store, _service = api
@@ -225,7 +227,12 @@ def test_schema_failures_cannot_be_approved(api, prompt: str) -> None:
 
 @pytest.mark.parametrize(
     "prompt",
-    ["SCENARIO:missing_tags", "SCENARIO:public_storage", "SCENARIO:excessive_qty"],
+    [
+        "SCENARIO:missing_tags",
+        "SCENARIO:public_storage",
+        "SCENARIO:excessive_qty",
+        "SCENARIO:bad_region",
+    ],
 )
 def test_policy_failures_cannot_be_approved(api, prompt: str) -> None:
     client, _store, _service = api
@@ -261,6 +268,278 @@ def test_unknown_region_wording_cannot_be_approved(api) -> None:
     )
     _assert_service_error(refused, 409, "status")
     assert client.get(f"/v1/plans/{created['id']}").json()["status"] == "draft"
+
+
+def test_planner_claiming_approval_is_a_schema_failure(api) -> None:
+    client, _store, _service = api
+    created = _create(client, "SCENARIO:extra_fields")
+    assert created["status"] == "draft"
+    assert created["proposed"] is None
+    assert created["plan_hash"] is None
+    assert created["cost"] is None
+    assert sorted((issue["code"], issue["field_path"]) for issue in created["validation_errors"]) == [
+        ("extra_forbidden", "cost"),
+        ("extra_forbidden", "status"),
+    ]
+
+
+def test_unlisted_region_is_a_policy_error_only(api) -> None:
+    client, _store, _service = api
+    created = _create(client, "SCENARIO:bad_region")
+    assert created["status"] == "evaluated"
+    assert created["cost"]["succeeded"] is True
+    errors = [check["policy_id"] for check in created["policy_checks"] if check["status"] == "error"]
+    assert errors == ["allowed_regions"]
+
+
+def test_prompt_minimum_is_thirty_characters_and_named_in_the_error(api) -> None:
+    client, store, _service = api
+    refused = client.post("/v1/plans", json={"prompt": "two web containers in US East"})
+    assert len("two web containers in US East") == 29
+    assert refused.status_code == 422
+    assert "at least 30 characters" in refused.text
+    assert store.list_records() == []
+
+    accepted = _create(client, "two web containers in US East.")
+    assert accepted["status"] == "evaluated"
+
+
+def test_scenario_tokens_are_exempt_from_the_minimum(api) -> None:
+    client, _store, _service = api
+    assert _create(client, "SCENARIO:malformed")["status"] == "draft"
+
+
+def test_prompt_at_the_length_limit_is_accepted(api) -> None:
+    client, store, _service = api
+    prompt = EXAMPLE_PROMPT + " " + "x" * (2000 - len(EXAMPLE_PROMPT) - 1)
+    assert len(prompt) == 2000
+    assert _create(client, prompt)["status"] == "evaluated"
+
+    refused = client.post("/v1/plans", json={"prompt": prompt + "x"})
+    assert refused.status_code == 422
+    assert len(store.list_records()) == 1
+
+
+def _model_plan(resources: list[dict[str, object]], *, region: str = "us-east-1") -> str:
+    return json.dumps(
+        {
+            "region": region,
+            "environment": "dev",
+            "tags": {"environment": "dev", "owner": "dev-team", "cost-center": "engineering"},
+            "resources": resources,
+        }
+    )
+
+
+_DB_SMALL = {"type": "postgres", "name": "database", "sku": "db-small", "quantity": 1, "public_access": False}
+_TWO_WEB = {"type": "container", "name": "web", "sku": "container-small", "quantity": 2, "public_access": False}
+
+
+def test_built_in_planner_plans_carry_no_interpretation_notes(api) -> None:
+    client, _store, _service = api
+    assert _create(client, EXAMPLE_PROMPT)["interpretation_notes"] == []
+
+
+def test_model_plan_matching_the_built_in_reading_says_so(api) -> None:
+    client, _store, service = api
+    record = service.create_plan(
+        EXAMPLE_PROMPT,
+        raw_output=_model_plan([_DB_SMALL, _TWO_WEB]),
+        generator="claude:claude-sonnet-5-5",
+    )
+    assert record.interpretation_notes == ["Matches the built-in planner's reading of the request."]
+    assert client.get(f"/v1/plans/{record.id}").json()["interpretation_notes"] == record.interpretation_notes
+
+
+def test_model_plan_that_adds_or_changes_resources_is_flagged_without_blocking(api) -> None:
+    client, _store, service = api
+    bucket = {
+        "type": "object_storage",
+        "name": "bucket",
+        "sku": "storage-standard",
+        "quantity": 1,
+        "capacity_gb": 100,
+        "public_access": False,
+    }
+    three_medium_web = {**_TWO_WEB, "sku": "container-medium", "quantity": 3}
+    record = service.create_plan(
+        EXAMPLE_PROMPT,
+        raw_output=_model_plan([_DB_SMALL, three_medium_web, bucket], region="us-west-2"),
+        generator="openai:gpt-5",
+    )
+    assert record.status.value == "evaluated"
+    assert record.interpretation_notes == [
+        "Region: the model chose us-west-2; the built-in reading is us-east-1.",
+        "container: the model has 3 × container-medium; the built-in reading has 2 × container-small.",
+        "object_storage: the model added 1 × storage-standard (100 GB); the request may not ask for it.",
+    ]
+    approved = client.post(f"/v1/plans/{record.id}/approve", json={"plan_hash": record.plan_hash})
+    assert approved.status_code == 200
+
+
+def test_model_plan_that_drops_a_requested_resource_is_flagged(api) -> None:
+    _client, _store, service = api
+    record = service.create_plan(
+        EXAMPLE_PROMPT,
+        raw_output=_model_plan([_TWO_WEB]),
+        generator="claude:claude-haiku-4-5",
+    )
+    assert record.interpretation_notes == [
+        "postgres: the model left out 1 × db-small, which the built-in reading found.",
+    ]
+
+
+def test_model_plan_is_not_compared_when_the_built_in_planner_cannot_read_the_prompt(api) -> None:
+    _client, _store, service = api
+    record = service.create_plan(
+        "Somewhere to keep customer records in US East",
+        raw_output=_model_plan([{**_DB_SMALL, "quantity": 2}]),
+        generator="openai:gpt-5",
+    )
+    assert record.interpretation_notes == [
+        "Not compared: the built-in planner could not read this request. "
+        "Check the plan against the request yourself.",
+    ]
+
+    scenario = service.create_plan(
+        "SCENARIO:malformed and two databases",
+        raw_output=_model_plan([_DB_SMALL]),
+        generator="openai:gpt-5",
+    )
+    assert scenario.interpretation_notes[0].startswith("Not compared:")
+
+
+def test_model_draft_has_no_interpretation_notes(api) -> None:
+    _client, _store, service = api
+    record = service.create_plan(EXAMPLE_PROMPT, raw_output="not json", generator="openai:gpt-5")
+    assert record.status.value == "draft"
+    assert record.interpretation_notes == []
+
+
+def test_corrected_typo_is_shown_on_the_built_in_plan(api) -> None:
+    client, _store, _service = api
+    created = _create(client, "I wnat to build a dataabse and container")
+    assert created["status"] == "evaluated"
+    assert [resource["type"] for resource in created["proposed"]["resources"]] == [
+        "postgres",
+        "container",
+    ]
+    assert created["interpretation_notes"] == [
+        "Read 'dataabse' as 'database' (likely typo, one letter off)."
+    ]
+    assert created["cost"]["monthly_total"] == "53"
+
+
+def test_defaults_are_called_out_when_the_request_omits_them(api) -> None:
+    client, _store, _service = api
+    created = _create(client, "I need a container and a database please")
+    assert created["status"] == "evaluated"
+    assert created["defaults_applied"] == [
+        "Region: the request names none, so the plan uses us-east-1.",
+        "Environment: the request names none, so the plan uses dev.",
+        "Size: none given for database (postgres), so it uses db-small, the smallest tier.",
+        "Size: none given for web (container), so it uses container-small, the smallest tier.",
+        "Tag owner: none named, so the plan uses dev-team.",
+        "Tag cost-center: none named, so the plan uses engineering.",
+    ]
+
+
+def test_fully_specified_request_only_reports_tag_defaults(api) -> None:
+    client, _store, _service = api
+    created = _create(client, EXAMPLE_PROMPT)
+    assert created["defaults_applied"] == [
+        "Tag owner: none named, so the plan uses dev-team.",
+        "Tag cost-center: none named, so the plan uses engineering.",
+    ]
+
+
+def test_built_in_planner_says_when_it_ignores_a_named_owner(api) -> None:
+    client, _store, _service = api
+    created = _create(client, "a small container in prod in iad owned by payments")
+    assert created["defaults_applied"] == [
+        "Tag owner: the request names an owner, but the built-in planner does not read owners, "
+        "so the plan uses dev-team.",
+        "Tag cost-center: none named, so the plan uses engineering.",
+    ]
+
+
+def test_built_in_planner_says_when_it_ignores_a_named_cost_center(api) -> None:
+    client, _store, _service = api
+    created = _create(client, "a small container in prod in iad, cost center 42")
+    assert (
+        "Tag cost-center: the request names a cost center, but the built-in planner does not "
+        "read cost-centers, so the plan uses engineering." in created["defaults_applied"]
+    )
+
+
+def test_storage_capacity_default_is_called_out(api) -> None:
+    client, _store, _service = api
+    created = _create(client, "object storage in prod in iad, owner and cost center are TBD")
+    assert "Capacity: none given for bucket (object_storage), so it uses 100 GB." in created["defaults_applied"]
+
+
+def test_model_plan_defaults_are_called_out_too(api) -> None:
+    _client, _store, service = api
+    record = service.create_plan(
+        "I need a container and a database please",
+        raw_output=_model_plan([_DB_SMALL, {**_TWO_WEB, "quantity": 1}]),
+        generator="openai:gpt-5",
+    )
+    assert record.defaults_applied[:2] == [
+        "Region: the request names none, so the plan uses us-east-1.",
+        "Environment: the request names none, so the plan uses dev.",
+    ]
+    # A model may read owners from the request, so no "does not read owners" note.
+    assert "Tag owner: none named, so the plan uses dev-team." in record.defaults_applied
+
+
+def test_drafts_and_scenarios_report_no_defaults(api) -> None:
+    client, _store, _service = api
+    assert _create(client, "Build a rocket for the launch next week")["defaults_applied"] == []
+    assert _create(client, "SCENARIO:missing_tags")["defaults_applied"] == []
+
+
+def test_distant_typo_is_a_draft_not_a_partial_plan(api) -> None:
+    client, _store, _service = api
+    created = _create(client, "A dataabes and a container for the team")
+    assert created["status"] == "draft"
+    [issue] = created["validation_errors"]
+    assert (issue["code"], issue["field_path"]) == ("unrecognized_input", "resources")
+    assert "'dataabes' (did you mean 'database'?)" in issue["message"]
+    refused = client.post(f"/v1/plans/{created['id']}/approve", json={"plan_hash": WRONG_HASH})
+    _assert_service_error(refused, 409, "status")
+
+
+def test_unsupported_resource_is_refused_not_dropped(api) -> None:
+    client, _store, _service = api
+    created = _create(client, "A redis cache and two containers in US East")
+    assert created["status"] == "draft"
+    assert "cannot provision the resource 'redis'" in created["validation_errors"][0]["message"]
+
+
+def test_unrecognized_resource_wording_cannot_be_approved(api) -> None:
+    client, _store, _service = api
+    created = _create(client, "Build a rocket for the launch next week.")
+    assert created["status"] == "draft"
+    assert created["proposed"] is None
+    assert created["plan_hash"] is None
+    assert [(issue["code"], issue["field_path"]) for issue in created["validation_errors"]] == [
+        ("unrecognized_input", "resources"),
+    ]
+
+    refused = client.post(
+        f"/v1/plans/{created['id']}/approve",
+        json={"plan_hash": WRONG_HASH},
+    )
+    _assert_service_error(refused, 409, "status")
+    assert client.get(f"/v1/plans/{created['id']}").json()["status"] == "draft"
+
+
+def test_the_word_us_still_evaluates_and_prices(api) -> None:
+    client, _store, _service = api
+    created = _create(client, "Give us two web containers in US East")
+    assert created["status"] == "evaluated"
+    assert created["cost"]["monthly_total"] == "36"
 
 
 def test_big_dev_database_is_not_rewritten_as_small(api) -> None:
@@ -505,6 +784,9 @@ def test_invalid_uuid_is_422(api, method: str, suffix: str) -> None:
         {"prompt": ["database"]},
         {"prompt": True},
         {"prompt": EXAMPLE_PROMPT, "region": "us-east-1"},
+        {"prompt": "x" * 2001},
+        {"prompt": "two containers"},
+        {"prompt": "  " + "x" * 29 + "   "},
     ],
 )
 def test_invalid_create_requests_are_422(api, payload: dict[str, object]) -> None:
@@ -555,7 +837,7 @@ def test_unrelated_planner_value_error_is_not_an_input_error(api) -> None:
     app.dependency_overrides[get_plan_service] = lambda: isolated
     client = TestClient(app)
     with pytest.raises(ValueError, match="not a scenario failure"):
-        client.post("/v1/plans", json={"prompt": "two web containers"})
+        client.post("/v1/plans", json={"prompt": "two web containers for the storefront"})
 
 
 def test_model_api_key_is_not_stored(api, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -573,7 +855,7 @@ def test_model_api_key_is_not_stored(api, monkeypatch: pytest.MonkeyPatch) -> No
     response = client.post(
         "/v1/plans",
         json={
-            "prompt": "one database in nowhere",
+            "prompt": "one database in nowhere for reporting",
             "provider": "openai",
             "model": "gpt-4.1-mini",
             "api_key": secret,
@@ -602,7 +884,7 @@ def test_provider_failure_stores_nothing(api, monkeypatch: pytest.MonkeyPatch) -
     response = client.post(
         "/v1/plans",
         json={
-            "prompt": "one database",
+            "prompt": "one database for the reporting service",
             "provider": "claude",
             "model": "claude-sonnet-5-5",
             "api_key": secret,
@@ -618,7 +900,7 @@ def test_missing_model_key_stores_nothing(api) -> None:
     client, store, _service = api
     response = client.post(
         "/v1/plans",
-        json={"prompt": "one database", "provider": "openai", "model": "gpt-5"},
+        json={"prompt": "one database for the reporting service", "provider": "openai", "model": "gpt-5"},
     )
     assert response.status_code == 422
     assert response.json()["code"] == "provider_error"
@@ -632,7 +914,7 @@ def test_decisions_keep_approved_and_rejected_plans(api) -> None:
         f"/v1/plans/{approved['id']}/approve",
         json={"plan_hash": approved["plan_hash"]},
     )
-    rejected = _create(client, "one database in US West")
+    rejected = _create(client, "one database in US West for reporting")
     client.post(f"/v1/plans/{rejected['id']}/reject")
     draft = _create(client, "SCENARIO:malformed")
 
@@ -696,7 +978,7 @@ def test_provider_failure_log_omits_the_api_key(
     response = client.post(
         "/v1/plans",
         json={
-            "prompt": "one database",
+            "prompt": "one database for the reporting service",
             "provider": "openai",
             "model": "gpt-5",
             "api_key": secret,
@@ -705,6 +987,45 @@ def test_provider_failure_log_omits_the_api_key(
     assert response.status_code == 422
     assert "provider_error" in caplog.text
     assert secret not in caplog.text
+
+
+def test_model_call_duration_is_logged_without_the_key(
+    api, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, _store, _service = api
+    secret = "sk-demo-secret-do-not-log"
+    caplog.set_level(logging.INFO, logger="app")
+    monkeypatch.setattr("app.main.complete_plan", lambda *_args, **_kwargs: _model_plan([_DB_SMALL]))
+    response = client.post(
+        "/v1/plans",
+        json={
+            "prompt": EXAMPLE_PROMPT,
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "api_key": secret,
+        },
+    )
+    assert response.status_code == 201
+    assert re.search(r"model call provider=claude model=claude-sonnet-5-5 model_ms=\d+ outcome=ok", caplog.text)
+    assert secret not in caplog.text
+
+
+def test_failed_model_call_duration_is_logged(
+    api, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, _store, _service = api
+    caplog.set_level(logging.INFO, logger="app")
+
+    def fail(*_args: object, **_kwargs: object) -> str:
+        raise ProviderError("The model provider did not respond in time.")
+
+    monkeypatch.setattr("app.main.complete_plan", fail)
+    response = client.post(
+        "/v1/plans",
+        json={"prompt": EXAMPLE_PROMPT, "provider": "openai", "model": "gpt-5", "api_key": "k"},
+    )
+    assert response.status_code == 422
+    assert re.search(r"model call provider=openai model=gpt-5 model_ms=\d+ outcome=provider_error", caplog.text)
 
 
 def test_schema_endpoint_matches_proposed_plan_schema(api) -> None:

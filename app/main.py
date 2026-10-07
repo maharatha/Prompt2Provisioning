@@ -9,6 +9,7 @@ prototype does not lock the in-memory store.
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Literal
 from uuid import UUID
@@ -67,6 +68,12 @@ class ApiError(BaseModel):
     message: str
 
 
+MAX_PROMPT_CHARS = 2000
+# Enough for a resource plus at least one of size, environment, or region.
+# SCENARIO: fixtures are exempt; the UI sends the bare token.
+MIN_PROMPT_CHARS = 30
+
+
 class CreatePlanRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -80,6 +87,13 @@ class CreatePlanRequest(BaseModel):
     def prompt_must_be_nonblank(cls, value: str) -> str:
         if value.strip() == "":
             raise ValueError("prompt must be nonblank")
+        if len(value) > MAX_PROMPT_CHARS:
+            raise ValueError(f"prompt must be at most {MAX_PROMPT_CHARS} characters")
+        if len(value.strip()) < MIN_PROMPT_CHARS and "SCENARIO:" not in value:
+            raise ValueError(
+                f"prompt must be at least {MIN_PROMPT_CHARS} characters: describe the "
+                "resources and, ideally, size, environment, and region"
+            )
         return value
 
 
@@ -97,6 +111,24 @@ _SERVICE_ERROR_RESPONSES = {
 
 def _error_content(code: str, message: str) -> dict[str, str]:
     return ApiError(code=code, message=message).model_dump()
+
+
+def _timed_model_call(body: CreatePlanRequest) -> str:
+    """Call the model and log how long it took. The key and prompt are not logged."""
+    start = time.perf_counter()
+    outcome = "provider_error"
+    try:
+        raw_output = complete_plan(body.provider, body.model, body.api_key, body.prompt)
+        outcome = "ok"
+        return raw_output
+    finally:
+        _LOG.info(
+            "model call provider=%s model=%s model_ms=%d outcome=%s",
+            body.provider,
+            body.model,
+            round((time.perf_counter() - start) * 1000),
+            outcome,
+        )
 
 
 def _log_plan(event: str, record: PlanRecord) -> None:
@@ -166,7 +198,7 @@ async def create_plan(
     if body.provider == "mock":
         record = service.create_plan(body.prompt)
     else:
-        raw_output = complete_plan(body.provider, body.model, body.api_key, body.prompt)
+        raw_output = _timed_model_call(body)
         record = service.create_plan(
             body.prompt,
             raw_output=raw_output,

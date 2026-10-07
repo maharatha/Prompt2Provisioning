@@ -2,6 +2,13 @@
 
 The result is one raw string, the same untrusted output the mock planner
 returns. This module does not validate, price, approve, or store the API key.
+
+Both calls ask the provider for JSON only: OpenAI JSON mode, and a Claude
+structured-output schema. That limits what the model may write. It does not
+change what it wrote, and ``app.validation`` still checks every field. The
+Claude schema is a looser shape than ``ProposedPlan``: structured outputs allow
+only closed objects and no numeric or length limits, so tags are limited to the
+three policy keys, each optional, and quantity has no range.
 """
 
 import json
@@ -10,10 +17,55 @@ from pathlib import Path
 
 import httpx
 
+from app.models import Environment, ResourceType
+
 OPENAI_MODELS = ("gpt-4.1-mini", "gpt-4.1", "gpt-5-mini", "gpt-5")
 CLAUDE_MODELS = ("claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5")
 MODEL_CHOICES = {"openai": OPENAI_MODELS, "claude": CLAUDE_MODELS}
 _DATA_DIR = Path(__file__).resolve().parent / "data"
+_CLAUDE_MAX_TOKENS = 16000
+# Turning a sentence into a small JSON plan is simple extraction, so ask for low
+# reasoning effort: much faster, and every plan is still checked afterwards.
+# Haiku 4.5 rejects "effort", and gpt-4.1 models reject "reasoning_effort".
+_CLAUDE_EFFORT_MODELS = frozenset({"claude-sonnet-5-5", "claude-opus-5-5"})
+_LOW_EFFORT = "low"
+_TIMEOUT_SECONDS = 120.0
+MAX_REPLY_BYTES = 32 * 1024
+
+_RESOURCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"type": "string", "enum": [item.value for item in ResourceType]},
+        "name": {"type": "string"},
+        "sku": {"type": "string"},
+        "quantity": {"type": "integer"},
+        "capacity_gb": {"type": "integer"},
+        "public_access": {"type": "boolean"},
+    },
+    "required": ["type", "name", "sku", "quantity", "public_access"],
+    "additionalProperties": False,
+}
+PLAN_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "region": {"type": "string"},
+        "environment": {"type": "string", "enum": [item.value for item in Environment]},
+        "tags": {
+            "type": "object",
+            "properties": {
+                "environment": {"type": "string"},
+                "owner": {"type": "string"},
+                "cost-center": {"type": "string"},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        "resources": {"type": "array", "items": _RESOURCE_SCHEMA},
+        "interpretation_error": {"type": "string"},
+    },
+    "required": [],
+    "additionalProperties": False,
+}
 
 
 class ProviderError(Exception):
@@ -48,11 +100,12 @@ def complete_plan(
         raise ProviderError(str(exc)) from exc
 
     owns_client = client is None
-    http = client if client is not None else httpx.Client(timeout=45.0)
+    http = client if client is not None else httpx.Client(timeout=_TIMEOUT_SECONDS)
     try:
         if provider == "openai":
-            return _openai(http, model, secret, prompt, brief)
-        return _claude(http, model, secret, prompt, brief)
+            text = _openai(http, model, secret, prompt, brief)
+        else:
+            text = _claude(http, model, secret, prompt, brief)
     except httpx.TimeoutException as exc:
         raise ProviderError("The model provider did not respond in time.") from exc
     except httpx.HTTPError as exc:
@@ -60,6 +113,9 @@ def complete_plan(
     finally:
         if owns_client:
             http.close()
+    if len(text.encode("utf-8")) > MAX_REPLY_BYTES:
+        raise ProviderError("The model reply was larger than 32 KB and was not stored.")
+    return text
 
 
 def interpretation_brief() -> str:
@@ -136,6 +192,8 @@ def _openai(http: httpx.Client, model: str, api_key: str, prompt: str, brief: st
                 {"role": "system", "content": brief},
                 {"role": "user", "content": prompt},
             ],
+            "response_format": {"type": "json_object"},
+            **({"reasoning_effort": _LOW_EFFORT} if model.startswith("gpt-5") else {}),
         },
     )
     payload = _json_body(response, api_key)
@@ -151,9 +209,13 @@ def _claude(http: httpx.Client, model: str, api_key: str, prompt: str, brief: st
         },
         json={
             "model": model,
-            "max_tokens": 2000,
+            "max_tokens": _CLAUDE_MAX_TOKENS,
             "system": brief,
             "messages": [{"role": "user", "content": prompt}],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": PLAN_OUTPUT_SCHEMA},
+                **({"effort": _LOW_EFFORT} if model in _CLAUDE_EFFORT_MODELS else {}),
+            },
         },
     )
     payload = _json_body(response, api_key)
@@ -177,13 +239,23 @@ def _text_from_openai(payload: Mapping[str, object], api_key: str) -> str:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         raise ProviderError("The model provider returned no text.")
+    _require_complete(choices[0].get("finish_reason"), declined="content_filter", cut_off="length")
     message = choices[0].get("message")
     if not isinstance(message, dict):
         raise ProviderError("The model provider returned no text.")
     return _as_text(message.get("content"), api_key)
 
 
+def _require_complete(reason: object, *, declined: str, cut_off: str) -> None:
+    """Refuse a reply the provider marked as declined or truncated."""
+    if reason == declined:
+        raise ProviderError("The model declined this request. Nothing was stored.")
+    if reason == cut_off:
+        raise ProviderError("The model reply was cut off before it finished. Nothing was stored.")
+
+
 def _text_from_claude(payload: Mapping[str, object], api_key: str) -> str:
+    _require_complete(payload.get("stop_reason"), declined="refusal", cut_off="max_tokens")
     blocks = payload.get("content")
     if not isinstance(blocks, list):
         raise ProviderError("The model provider returned no text.")

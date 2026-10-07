@@ -120,6 +120,57 @@ def test_unrecognized_region_is_one_validation_issue(planner: MockPlanner) -> No
     assert "US NORTH" in issue.message
 
 
+def test_unrecognized_resources_point_at_resources(planner: MockPlanner) -> None:
+    result = validate_raw_plan(planner.generate("Build a rocket for the launch next week."))
+    assert result.proposed is None
+    assert [(issue.code, issue.field_path) for issue in result.errors] == [
+        ("unrecognized_input", "resources"),
+    ]
+
+
+@pytest.mark.parametrize("field", [None, "tags", 7])
+def test_interpretation_field_outside_the_known_set_points_at_region(field: object) -> None:
+    payload: dict[str, object] = {"interpretation_error": "Unrecognized input."}
+    if field is not None:
+        payload["interpretation_field"] = field
+    result = validate_raw_plan(json.dumps(payload))
+    assert [(issue.code, issue.field_path) for issue in result.errors] == [
+        ("unrecognized_input", "region"),
+    ]
+
+
+def _plan_with(region: str = "us-east-1", tags: dict[str, str] | None = None) -> str:
+    return json.dumps(
+        {
+            "region": region,
+            "environment": "dev",
+            "tags": tags if tags is not None else _tags(),
+            "resources": [
+                {"type": "postgres", "name": "database", "sku": "db-small", "quantity": 1, "public_access": False}
+            ],
+        }
+    )
+
+
+def test_region_and_tags_at_their_length_limits_are_accepted() -> None:
+    result = validate_raw_plan(_plan_with(region="r" * 32, tags={**_tags(), "k" * 128: "v" * 128}))
+    assert result.errors == ()
+
+
+@pytest.mark.parametrize(
+    ("raw", "field_path", "message"),
+    [
+        (_plan_with(region="r" * 33), "region", "region must be at most 32 characters"),
+        (_plan_with(tags={**_tags(), "k" * 129: "v"}), "tags", "tag keys must be at most 128 characters"),
+        (_plan_with(tags={**_tags(), "note": "v" * 129}), "tags", "tag values must be at most 128 characters"),
+    ],
+)
+def test_overlong_region_and_tags_fail_schema(raw: str, field_path: str, message: str) -> None:
+    result = validate_raw_plan(raw)
+    assert result.proposed is None
+    assert [(issue.field_path, issue.message) for issue in result.errors] == [(field_path, message)]
+
+
 def test_malformed_json_is_a_validation_failure(planner: MockPlanner) -> None:
     result = validate_raw_plan(planner.generate("one database", scenario="malformed_json"))
 

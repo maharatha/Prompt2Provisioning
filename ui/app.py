@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import html
+import json
 import os
 from collections.abc import Callable, Mapping
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -25,23 +26,84 @@ EXAMPLE_PROMPT = (
     "A small PostgreSQL database and two web containers for a development team "
     "in US East, optimized for low cost."
 )
+# Example requests, grouped by what the built-in planner and the checks do with
+# them. Each entry: (button label, request text, outcome, what to look for).
+# tests/test_ui.py runs every entry through the real service so the stated
+# outcome cannot drift from the app.
+OUTCOME_GROUPS = (
+    ("approvable", "Approvable"),
+    ("warning", "Approvable with a warning"),
+    ("policy_error", "Blocked by a policy"),
+    ("draft", "Stays a draft"),
+    ("model", "Loose wording: try OpenAI or Anthropic"),
+)
 SUGGESTED_PROMPTS = (
-    ("Small dev database and two web containers", EXAMPLE_PROMPT),
+    (
+        "Dev database and two web containers",
+        EXAMPLE_PROMPT,
+        "approvable",
+        "Every check passes. USD 71.00 a month.",
+    ),
+    (
+        "Production web tier in US West",
+        "Three small web containers for production in US West.",
+        "approvable",
+        "Production in us-west-2. USD 54.00 a month.",
+    ),
+    (
+        "Storage in Azure East US",
+        "100 GB object storage for a test team in Azure East US.",
+        "approvable",
+        "Region stays eastus2. Storage is priced per GB: USD 2.50 a month.",
+    ),
+    (
+        "DevOps shorthand",
+        "3 replicas of the api and an rds postgres in iad for uat, plus a 200 GB bucket.",
+        "approvable",
+        "Synonyms are read and listed under How the request was read. USD 94.00 a month.",
+    ),
+    (
+        "Typo it can correct",
+        "I wnat to build a dataabse and container",
+        "approvable",
+        "'dataabse' is read as database, and the correction is shown. USD 53.00 a month.",
+    ),
     (
         "Medium database in development",
         "A medium PostgreSQL database for a development team in US East.",
+        "warning",
+        "dev_medium_cost warns about cost. Approve stays available. USD 95.00 a month.",
     ),
     (
-        "Three production web containers in US West",
-        "Three small web containers for production in US West.",
+        "Six web containers",
+        "Six small web containers for a development team in US East.",
+        "policy_error",
+        "resource_limits allows at most 5 containers. Approve is disabled.",
     ),
     (
-        "Object storage in Azure East US",
-        "100 GB object storage for a test team in Azure East US.",
+        "A region the app does not know",
+        "Two web containers in US North.",
+        "draft",
+        "The planner refuses to guess a region. Nothing to approve.",
     ),
     (
-        "Unrecognized wording",
+        "Nothing the planner recognizes",
         "Build a rocket for the launch next week.",
+        "draft",
+        "No known resource, so no plan is invented. Nothing to approve.",
+    ),
+    (
+        "Something the app cannot build",
+        "A redis cache and two web containers in US East.",
+        "draft",
+        "Redis is a known DevOps term but not supported, so it is refused, not dropped.",
+    ),
+    (
+        "Plain-language description",
+        "We need somewhere to keep customer records, plus a couple of boxes to serve the storefront.",
+        "model",
+        "No resource word here, so the built-in planner returns a draft. "
+        "A model can read it, and its plan goes through the same checks.",
     ),
 )
 _WORKFLOW_HTML = Path(__file__).resolve().parents[1] / "docs" / "button-flow.html"
@@ -54,11 +116,16 @@ SCENARIO_TOKENS = (
     "unsupported_sku",
     "excessive_qty",
     "public_storage",
+    "extra_fields",
+    "bad_region",
 )
 PLAN_RECORD_KEY = "plan_record"
 API_ERROR_KEY = "api_error"
 DECISION_LOG_KEY = "decision_log"
 PLANNER_BUILTIN = "Built-in"
+# Mirror the API limits; the API still enforces both.
+MAX_PROMPT_CHARS = 2000
+MIN_PROMPT_CHARS = 30
 OPENAI_MODEL = "gpt-5"
 ANTHROPIC_MODEL = "claude-sonnet-5-5"
 _DECISION_STATUSES = frozenset({"approved", "rejected", "artifact_generated"})
@@ -112,17 +179,14 @@ def api_base_url() -> str:
 
 
 def submitted_prompt(text: str, scenario: str) -> str:
-    """Return the prompt to post, including a selected demo scenario token."""
-    prompt = text if isinstance(text, str) else ""
-    if scenario not in SCENARIO_TOKENS:
-        return prompt
-    token = f"SCENARIO:{scenario}"
-    if prompt.lstrip().startswith(token):
-        return prompt
-    body = prompt.strip()
-    if not body:
-        return token
-    return f"{token}\n{body}"
+    """Return the prompt to post.
+
+    A selected demo scenario sends only its token. The planner ignores the
+    request text for a scenario, and sending it could exceed the prompt limit.
+    """
+    if scenario in SCENARIO_TOKENS:
+        return f"SCENARIO:{scenario}"
+    return text if isinstance(text, str) else ""
 
 
 def parse_decimal_string(value: object) -> Decimal:
@@ -181,6 +245,101 @@ def can_approve(record: object) -> bool:
         if check.get("status") == "error":
             return False
     return cost_is_successful(record.get("cost"))
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}" if count == 1 else f"{count} {word}s"
+
+
+def plan_verdict(record: object) -> tuple[str, str, str, list[str]] | None:
+    """Summarise a plan record for the review banner.
+
+    Returns ``(kind, title, detail, reasons)`` where kind is ``fail``, ``warn``,
+    ``pass``, or ``rejected``. ``reasons`` lists the findings behind the verdict.
+    Returns None when there is no record.
+    """
+    if not isinstance(record, dict):
+        return None
+    status = _status_of(record)
+    checks = [item for item in record.get("policy_checks") or [] if isinstance(item, dict)]
+    errors = [item for item in record.get("validation_errors") or [] if isinstance(item, dict)]
+    warnings = [
+        f"{item.get('policy_id')}: {item.get('message')}"
+        for item in checks
+        if item.get("status") == "warning"
+    ]
+    if status == "rejected":
+        return (
+            "rejected",
+            "Rejected",
+            "This plan will not proceed. A new request creates a new plan.",
+            [],
+        )
+    if status in {"approved", "artifact_generated"}:
+        title = "Approved" if status == "approved" else "Approved · dry-run artifact generated"
+        detail = (
+            "Generate the dry-run artifact next."
+            if status == "approved"
+            else "Download main.tf below. Nothing was deployed."
+        )
+        return ("pass", title, detail, [])
+    if status == "draft":
+        reasons = [_validation_message(issue) for issue in errors]
+        return (
+            "fail",
+            "Not a valid plan",
+            "The planner's output failed validation, so policies and pricing did not run. "
+            "It cannot be approved. Change the request and generate again, or reject it.",
+            reasons or ["The plan has no validated proposal."],
+        )
+    if can_approve(record):
+        cost = record.get("cost")
+        total = format_usd(cost["monthly_total"]) if isinstance(cost, dict) else ""
+        defaults = _defaults_count(record)
+        defaults_note = (
+            f" Uses {_plural(defaults, 'default')} you did not specify; see the list below."
+            if defaults
+            else ""
+        )
+        if warnings:
+            return (
+                "warn",
+                f"Approvable with {_plural(len(warnings), 'warning')}",
+                f"Warnings do not block approval. Read them before you approve. "
+                f"{total} a month.{defaults_note}",
+                warnings,
+            )
+        return (
+            "pass",
+            "Ready for approval",
+            f"Every check passed. {total} a month.{defaults_note}",
+            [],
+        )
+    reasons = [_validation_message(issue) for issue in errors]
+    reasons += [
+        f"{item.get('policy_id')}: {item.get('message')}"
+        for item in checks
+        if item.get("status") == "error"
+    ]
+    cost = record.get("cost")
+    if not cost_is_successful(cost):
+        pricing_errors = cost.get("pricing_errors") if isinstance(cost, dict) else None
+        if isinstance(pricing_errors, list) and pricing_errors:
+            reasons += [f"Pricing: {item}" for item in pricing_errors if isinstance(item, str)]
+        else:
+            reasons.append("Pricing: the synthetic estimate did not succeed.")
+    return (
+        "fail",
+        "Blocked: cannot be approved",
+        "Fix the request and generate a new plan, or reject this one.",
+        reasons or ["Approval is blocked."],
+    )
+
+
+def _validation_message(issue: Mapping[str, Any]) -> str:
+    field_path = issue.get("field_path")
+    location = f" at {field_path}" if isinstance(field_path, str) and field_path else ""
+    return f"Validation error: {issue.get('code')}{location}: {issue.get('message')}"
 
 
 def can_reject(record: object) -> bool:
@@ -486,6 +645,120 @@ def _call(operation: Callable[[], dict[str, Any]]) -> None:
     _remember_success(record)
 
 
+def prompt_ready(text: object, *, planner: object, scenario: object) -> bool:
+    """True when Generate plan may run: 30+ characters, or a built-in scenario."""
+    if planner == PLANNER_BUILTIN and scenario in SCENARIO_TOKENS:
+        return True
+    return isinstance(text, str) and len(text.strip()) >= MIN_PROMPT_CHARS
+
+
+def prompt_length_html(text: object) -> str:
+    """The character count under the request box, as of the last Streamlit run.
+
+    ``LIVE_PROMPT_SCRIPT`` keeps it current while the person types.
+    """
+    length = len(text.strip()) if isinstance(text, str) else 0
+    if length >= MIN_PROMPT_CHARS:
+        return (
+            f'<div class="p2p-count ok" data-p2p-mode="length">✓ {length} characters '
+            f"(minimum {MIN_PROMPT_CHARS})</div>"
+        )
+    missing = MIN_PROMPT_CHARS - length
+    return (
+        f'<div class="p2p-count short" data-p2p-mode="length">✗ {length} of '
+        f"{MIN_PROMPT_CHARS} characters. "
+        f"Add {missing} more: name the resources and, ideally, size, environment, and region."
+        "</div>"
+        '<div class="p2p-count-hint">The count updates when you press Ctrl+Enter '
+        "or click outside the box.</div>"
+    )
+
+
+# Streamlit only sends a text box's value on Ctrl+Enter or blur, so the server
+# cannot react to each keystroke. This script runs in the page itself: on every
+# keystroke, and after every Streamlit redraw, it updates the count line and
+# enables or disables Generate plan. The server never disables the button,
+# because React would then swallow the first click after typing; the script
+# owns that state, and _on_generate still refuses a short request as a backstop.
+LIVE_PROMPT_SCRIPT = """
+(() => {
+  if (window.__p2pLivePrompt) { window.__p2pLivePrompt(); return; }
+  const MIN = __MIN__;
+  const doc = document;
+  const apply = () => {
+    const box = doc.querySelector('.st-key-prompt_text textarea');
+    const button = doc.querySelector('.st-key-generate button');
+    const count = doc.querySelector('.p2p-count');
+    if (!box || !button || !count) return;
+    if (count.dataset.p2pMode !== 'length') {
+      if (button.disabled) button.disabled = false;
+      return;
+    }
+    const length = box.value.trim().length;
+    const ready = length >= MIN;
+    if (button.disabled === ready) button.disabled = !ready;
+    button.title = ready ? '' : `Write at least ${MIN} characters first.`;
+    const text = ready
+      ? `\\u2713 ${length} characters (minimum ${MIN})`
+      : `\\u2717 ${length} of ${MIN} characters. Add ${MIN - length} more: ` +
+        'name the resources and, ideally, size, environment, and region.';
+    if (count.textContent !== text) {
+      count.textContent = text;
+      count.className = 'p2p-count ' + (ready ? 'ok' : 'short');
+    }
+    const hint = doc.querySelector('.p2p-count-hint');
+    if (hint) hint.style.display = 'none';
+  };
+  window.__p2pLivePrompt = apply;
+  doc.addEventListener('input', (event) => {
+    if (event.target && event.target.tagName === 'TEXTAREA') apply();
+  }, true);
+  new MutationObserver(() => requestAnimationFrame(apply))
+    .observe(doc.body, { childList: true, subtree: true });
+  apply();
+})();
+""".replace("__MIN__", str(MIN_PROMPT_CHARS))
+
+
+def live_prompt_installer_html() -> str:
+    """HTML for a zero-height component that installs LIVE_PROMPT_SCRIPT in the page.
+
+    The component runs in an iframe; the script is copied into the parent page
+    so it keeps working when Streamlit redraws or replaces the iframe.
+    """
+    return (
+        "<script>(() => { const host = window.parent.document;"
+        " if (host.getElementById('p2p-live-prompt')) {"
+        " if (window.parent.__p2pLivePrompt) window.parent.__p2pLivePrompt(); return; }"
+        " const script = host.createElement('script'); script.id = 'p2p-live-prompt';"
+        f" script.textContent = {json.dumps(LIVE_PROMPT_SCRIPT)};"
+        " host.head.appendChild(script); })();</script>"
+    )
+
+
+def busy_overlay_html(title: str, detail: str) -> str:
+    """A centred, full-screen 'working' overlay shown while a plan is generated."""
+    return (
+        "<style>"
+        ".p2p-busy{position:fixed;inset:0;z-index:999999;display:flex;align-items:center;"
+        "justify-content:center;background:rgba(15,23,42,.45);backdrop-filter:blur(2px);}"
+        ".p2p-busy-card{background:var(--background-color,#fff);color:var(--text-color,#111);"
+        "border-radius:14px;padding:28px 36px;max-width:440px;text-align:center;"
+        "box-shadow:0 12px 40px rgba(0,0,0,.25);}"
+        ".p2p-busy-spinner{width:56px;height:56px;margin:0 auto 16px;border-radius:50%;"
+        "border:6px solid rgba(37,99,235,.18);border-top-color:#2563eb;"
+        "animation:p2p-spin .9s linear infinite;}"
+        ".p2p-busy-title{font-size:1.2rem;font-weight:800;}"
+        ".p2p-busy-detail{margin-top:6px;opacity:.8;}"
+        "@keyframes p2p-spin{to{transform:rotate(360deg);}}"
+        "</style>"
+        '<div class="p2p-busy" role="alert" aria-busy="true">'
+        '<div class="p2p-busy-card"><div class="p2p-busy-spinner"></div>'
+        f'<div class="p2p-busy-title">{_text(title)}</div>'
+        f'<div class="p2p-busy-detail">{_text(detail)}</div></div></div>'
+    )
+
+
 def _on_generate() -> None:
     text = st.session_state.get("prompt_text", "")
     scenario = st.session_state.get("scenario", SCENARIO_NONE)
@@ -494,14 +767,41 @@ def _on_generate() -> None:
     if not isinstance(scenario, str):
         scenario = SCENARIO_NONE
     provider = st.session_state.get("planner_provider", PLANNER_BUILTIN)
-    if provider == "OpenAI":
-        _generate_with_model("openai", OPENAI_MODEL, "openai_api_key", text)
+    # Backstop for the disabled button: the box may hold uncommitted text.
+    if not prompt_ready(text, planner=provider, scenario=scenario):
+        st.session_state[API_ERROR_KEY] = {
+            "message": (
+                f"The request needs at least {MIN_PROMPT_CHARS} characters. "
+                "Name the resources and, ideally, size, environment, and region."
+            ),
+            "status_code": None,
+        }
         return
-    if provider == "Anthropic":
-        _generate_with_model("claude", ANTHROPIC_MODEL, "anthropic_api_key", text)
-        return
-    prompt = submitted_prompt(text, scenario)
-    _call(lambda: create_plan(prompt))
+    if provider in ("OpenAI", "Anthropic"):
+        model = OPENAI_MODEL if provider == "OpenAI" else ANTHROPIC_MODEL
+        title = f"Waiting for {provider} ({model})…"
+        detail = (
+            "Model calls can take up to a minute. When the reply arrives it is checked "
+            "against the same schema, policies, and prices as any plan."
+        )
+    else:
+        title = "Generating plan…"
+        detail = "The built-in planner is reading your request and running the checks."
+    # Output from a callback takes the page's first slots, so re-emit the page
+    # style first; otherwise the overlay would replace it and unstyle the page.
+    _inject_style()
+    overlay = st.empty()
+    overlay.markdown(busy_overlay_html(title, detail), unsafe_allow_html=True)
+    try:
+        if provider == "OpenAI":
+            _generate_with_model("openai", OPENAI_MODEL, "openai_api_key", text)
+        elif provider == "Anthropic":
+            _generate_with_model("claude", ANTHROPIC_MODEL, "anthropic_api_key", text)
+        else:
+            prompt = submitted_prompt(text, scenario)
+            _call(lambda: create_plan(prompt))
+    finally:
+        overlay.empty()
 
 
 def _generate_with_model(provider: str, model: str, secret_key: str, text: str) -> None:
@@ -603,6 +903,16 @@ def _phase(record: object) -> str:
     return "request"
 
 
+def _failed_step(record: object) -> str | None:
+    """Return the step where a plan stopped: review for a draft, decision when blocked."""
+    status = _status_of(record)
+    if status == "draft":
+        return "review"
+    if status == "evaluated" and not can_approve(record):
+        return "decision"
+    return None
+
+
 def _step_class(name: str, phase: str, status: str | None) -> str:
     order = [item[0] for item in _PHASES]
     if status == "artifact_generated":
@@ -632,19 +942,27 @@ def _step_detail(name: str, status: str | None) -> str:
     return ""
 
 
+_FAILED_DETAIL = {"review": "Failed validation", "decision": "Approval blocked"}
+
+
 def _stepper(record: object) -> str:
     phase = _phase(record)
     status = _status_of(record)
+    failed = _failed_step(record)
     parts = ['<div class="p2p-bar">']
     for index, (name, label, _detail) in enumerate(_PHASES):
         kind = _step_class(name, phase, status)
+        detail = _step_detail(name, status)
+        number = str(index + 1)
+        if name == failed:
+            kind, detail, number = "failed", _FAILED_DETAIL[name], "✗"
         if index:
             rule = "done" if _step_class(_PHASES[index - 1][0], phase, status) == "done" else ""
             parts.append(f'<div class="p2p-rule {rule}"></div>')
         parts.append(
             f'<div class="p2p-step {kind}">'
-            f'<span class="p2p-num">{index + 1}</span>'
-            f"<span><strong>{label}</strong><small>{_step_detail(name, status)}</small></span>"
+            f'<span class="p2p-num">{number}</span>'
+            f"<span><strong>{label}</strong><small>{detail}</small></span>"
             "</div>"
         )
     parts.append("</div>")
@@ -750,36 +1068,145 @@ def _inject_style() -> None:
             border-bottom: 1px solid rgba(49, 51, 63, 0.15);
             vertical-align: top;
         }
-        .p2p-pass, .p2p-fail, .p2p-warn { font-weight: 650; white-space: nowrap; }
-        .p2p-pass { color: #1d6b45; }
-        .p2p-fail { color: #b42318; }
-        .p2p-warn { color: #b54708; }
+        .p2p-pass, .p2p-fail, .p2p-warn { font-weight: 650; }
+        .p2p-policy .p2p-pass, .p2p-policy .p2p-fail, .p2p-policy .p2p-warn { white-space: nowrap; }
+        .p2p-pass { color: #15803d; }
+        .p2p-fail { color: #dc2626; }
+        .p2p-warn { color: #d97706; }
+        .p2p-fail-line { color: #dc2626; font-weight: 700; margin: 0.15rem 0 0.4rem; }
+        .p2p-muted-line { opacity: 0.6; }
+        .p2p-errors td { color: var(--text-color); }
+        .p2p-errors { border-left: 4px solid #dc2626; }
+        /* Verdict banner: the first thing in Review, coloured by outcome. */
+        .p2p-verdict {
+          display: flex;
+          gap: 14px;
+          align-items: flex-start;
+          padding: 14px 18px;
+          border-radius: 10px;
+          border: 1px solid;
+          border-left-width: 8px;
+          margin: 4px 0 10px;
+        }
+        .p2p-verdict-icon {
+          flex: 0 0 auto;
+          width: 34px;
+          height: 34px;
+          border-radius: 50%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 20px;
+          font-weight: 800;
+          color: #ffffff;
+        }
+        .p2p-verdict-title { font-size: 1.25rem; font-weight: 800; line-height: 1.3; }
+        .p2p-verdict-detail { margin-top: 2px; color: var(--text-color); }
+        .p2p-verdict-reasons { margin: 8px 0 0; padding-left: 1.1rem; color: var(--text-color); }
+        .p2p-verdict-reasons li { margin: 2px 0; }
+        .p2p-verdict.fail { background: rgba(220, 38, 38, 0.10); border-color: #dc2626; }
+        .p2p-verdict.fail .p2p-verdict-icon { background: #dc2626; }
+        .p2p-verdict.fail .p2p-verdict-title { color: #dc2626; }
+        .p2p-verdict.warn { background: rgba(217, 119, 6, 0.10); border-color: #d97706; }
+        .p2p-verdict.warn .p2p-verdict-icon { background: #d97706; }
+        .p2p-verdict.warn .p2p-verdict-title { color: #d97706; }
+        .p2p-verdict.pass { background: rgba(22, 163, 74, 0.10); border-color: #16a34a; }
+        .p2p-verdict.pass .p2p-verdict-icon { background: #16a34a; }
+        .p2p-verdict.pass .p2p-verdict-title { color: #16a34a; }
+        .p2p-verdict.rejected { background: rgba(100, 116, 139, 0.12); border-color: #64748b; }
+        .p2p-verdict.rejected .p2p-verdict-icon { background: #64748b; }
+        .p2p-pill {
+          display: inline-block;
+          padding: 2px 10px;
+          border-radius: 999px;
+          font-weight: 700;
+          font-size: 0.85rem;
+          color: #ffffff;
+          margin-right: 10px;
+        }
+        .p2p-pill.fail { background: #dc2626; }
+        .p2p-pill.warn { background: #d97706; }
+        .p2p-pill.pass { background: #16a34a; }
+        .p2p-pill.rejected { background: #64748b; }
+        .p2p-plan-id { opacity: 0.75; font-size: 0.9rem; }
+        .p2p-count { font-size: 0.9rem; font-weight: 650; margin-top: -6px; }
+        .p2p-count.ok { color: #15803d; }
+        .p2p-count.short { color: #dc2626; }
+        .p2p-count-hint { font-size: 0.8rem; opacity: 0.7; }
+        /* Defaults the request did not state: informational, but hard to miss. */
+        .p2p-defaults {
+          margin: 10px 0 12px;
+          padding: 12px 16px;
+          border-radius: 10px;
+          border: 1px solid #2563eb;
+          border-left-width: 6px;
+          background: rgba(37, 99, 235, 0.08);
+        }
+        .p2p-defaults-title { font-weight: 800; color: #2563eb; font-size: 1.05rem; }
+        .p2p-defaults-detail { color: var(--text-color); opacity: 0.85; margin-top: 2px; }
+        .p2p-defaults ul { margin: 6px 0 0; padding-left: 1.1rem; color: var(--text-color); }
+        .p2p-step.failed .p2p-num {
+          background: #dc2626;
+          border-color: #dc2626;
+          color: #ffffff;
+          font-weight: 800;
+        }
+        .p2p-step.failed small { color: #dc2626; opacity: 1; font-weight: 650; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
+BUILTIN_WORDING_CAPTION = (
+    "Recognized words: database, mysql, container, object storage, sizes, quantities, dev/test/prod, "
+    "and US East, US West, Azure East US, plus DevOps terms such as rds, pg, mariadb, pods, api, "
+    "microservices, bucket, uat, prd, iad, and 'api x3' or '3 replicas'. One-letter typos "
+    "(dataabse) are corrected, and every correction is shown in the review. "
+    "Unsupported resources (redis, vm) and regions (Frankfurt, Europe) are refused, not dropped. "
+    "No, not, or without before a resource leaves it out. Other wording is ignored."
+)
+MODEL_WORDING_CAPTION = (
+    "Any wording. The model's reply is untrusted: it is checked against the same schema, "
+    "policies, and synthetic prices as the built-in planner, and you approve the exact plan shown."
+)
+
+
+def _wording_caption(planner_choice: str) -> str:
+    if planner_choice == PLANNER_BUILTIN:
+        return BUILTIN_WORDING_CAPTION
+    return MODEL_WORDING_CAPTION
+
+
 def _use_suggested_prompt(prompt: str) -> None:
     st.session_state["prompt_text"] = prompt
+    # A selected scenario would replace the example text, so clear it.
+    st.session_state["scenario"] = SCENARIO_NONE
 
 
 def _render_prompt_help() -> None:
-    with st.popover("Suggested prompts", type="tertiary"):
-        st.markdown("**Suggested prompts**")
+    with st.popover("Examples", icon=":material/lightbulb:", type="tertiary"):
         st.caption(
-            "Choosing one replaces the request text. "
-            "Unrecognized wording still returns one small web container."
+            "Choose one to put it in the request box, then select Generate plan. "
+            "Hover over a button to see the full request."
         )
-        for index, (label, prompt) in enumerate(SUGGESTED_PROMPTS):
-            st.button(
-                label,
-                key=f"suggest_{index}",
-                on_click=_use_suggested_prompt,
-                args=(prompt,),
-                use_container_width=True,
-            )
-            st.caption(prompt)
+        index = 0
+        for outcome, heading in OUTCOME_GROUPS:
+            items = [item for item in SUGGESTED_PROMPTS if item[2] == outcome]
+            if not items:
+                continue
+            st.markdown(f"**{heading}**")
+            for label, prompt, _outcome, look_for in items:
+                st.button(
+                    label,
+                    key=f"suggest_{index}",
+                    help=prompt,
+                    on_click=_use_suggested_prompt,
+                    args=(prompt,),
+                    use_container_width=True,
+                )
+                st.caption(look_for)
+                index += 1
 
 
 def _render_intro(record: object) -> None:
@@ -826,10 +1253,11 @@ def _render_request(record: object) -> None:
                 st.markdown("Infrastructure request")
             with help_col:
                 _render_prompt_help()
-            st.text_area(
+            prompt_text = st.text_area(
                 "Infrastructure request",
                 value=EXAMPLE_PROMPT,
                 height=148,
+                max_chars=MAX_PROMPT_CHARS,
                 key="prompt_text",
                 label_visibility="collapsed",
             )
@@ -856,29 +1284,45 @@ def _render_request(record: object) -> None:
                     key="anthropic_api_key",
                     help="Used for this request only. It is not stored.",
                 )
-            st.selectbox(
-                "Demo scenario",
-                options=(SCENARIO_NONE, *SCENARIO_TOKENS),
-                key="scenario",
-            )
-            st.caption(
-                "Scenarios apply to the built-in planner. None uses the request text. "
-                "Any other value sends a fixed fixture and skips vocabulary parsing."
-            )
+            if planner_choice == PLANNER_BUILTIN:
+                st.selectbox(
+                    "Demo scenario",
+                    options=(SCENARIO_NONE, *SCENARIO_TOKENS),
+                    key="scenario",
+                )
+                st.caption(
+                    "Scenarios apply to the built-in planner. None uses the request text. "
+                    "Any other value sends only a fixed fixture; the request text is not sent."
+                )
+            scenario_choice = st.session_state.get("scenario", SCENARIO_NONE)
+            # Not disabled server-side: LIVE_PROMPT_SCRIPT enables and disables it
+            # as the person types, and _on_generate refuses a short request.
             st.button(
                 "Generate plan",
                 key="generate",
-                type="primary" if _phase(record) == "request" else "secondary",
+                type="primary",
                 on_click=_on_generate,
                 use_container_width=True,
             )
-        st.caption(
-            "Recognized words: database, mysql, website, container, object storage, blob storage, "
-            "small, medium, big, large, one, single, two, pair, couple, three, dev, test, prod, "
-            "US East, Northern Virginia, US West, Oregon, Azure East US. "
-            "An unrecognized US or Azure region is an error. It is not replaced with US East. "
-            "Other wording is ignored."
-        )
+        with prompt_col:
+            if planner_choice == PLANNER_BUILTIN and scenario_choice in SCENARIO_TOKENS:
+                st.markdown(
+                    '<div class="p2p-count ok" data-p2p-mode="scenario">'
+                    "Scenario selected: the request text is not sent.</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(prompt_length_html(prompt_text), unsafe_allow_html=True)
+            components.html(live_prompt_installer_html(), height=0)
+        st.caption(_wording_caption(planner_choice))
+        verdict = plan_verdict(record)
+        if verdict is not None:
+            kind, title, _detail, reasons = verdict
+            summary = f"{_plural(len(reasons), 'finding')}. " if reasons else ""
+            st.markdown(
+                verdict_html((kind, title, f"{summary}Details are in 2 Review below.", [])),
+                unsafe_allow_html=True,
+            )
 
 
 def _render_error() -> None:
@@ -906,7 +1350,9 @@ def _render_review(record: object) -> None:
             st.error("The saved plan could not be displayed.")
             return
 
+        _render_verdict(record)
         _render_review_identity(record)
+        _render_defaults(record.get("defaults_applied"))
         resource_col, side_col = st.columns([1.35, 1], gap="medium")
         with resource_col:
             _render_proposal(record.get("proposed"))
@@ -914,13 +1360,47 @@ def _render_review(record: object) -> None:
             _render_region_card(record.get("proposed"))
             _render_tags(record.get("proposed"))
         _render_validation(record.get("validation_errors"))
+        _render_interpretation_notes(record.get("interpretation_notes"), record.get("generator"))
         _render_cost(record.get("cost"))
         _render_policies(record.get("policy_checks"))
         _render_raw_output(record.get("raw_output"))
 
 
+_VERDICT_ICONS = {"fail": "✗", "warn": "!", "pass": "✓", "rejected": "–"}
+
+
+def _text(value: object) -> str:
+    """Escape text for an HTML text node. Plan text can come from a model."""
+    return html.escape(str(value), quote=False)
+
+
+def verdict_html(verdict: tuple[str, str, str, list[str]]) -> str:
+    kind, title, detail, reasons = verdict
+    items = "".join(f"<li>{_text(reason)}</li>" for reason in reasons)
+    reason_list = f'<ul class="p2p-verdict-reasons">{items}</ul>' if items else ""
+    return (
+        f'<div class="p2p-verdict {kind}" role="status">'
+        f'<span class="p2p-verdict-icon">{_VERDICT_ICONS[kind]}</span>'
+        f'<div><div class="p2p-verdict-title">{_text(title)}</div>'
+        f'<div class="p2p-verdict-detail">{_text(detail)}</div>{reason_list}</div>'
+        "</div>"
+    )
+
+
+def _render_verdict(record: object) -> None:
+    verdict = plan_verdict(record)
+    if verdict is not None:
+        st.markdown(verdict_html(verdict), unsafe_allow_html=True)
+
+
 def _render_review_identity(record: Mapping[str, Any]) -> None:
-    st.markdown(f"Status: {record.get('status')} · Plan ID: {record.get('id')}")
+    verdict = plan_verdict(record)
+    kind = verdict[0] if verdict else "rejected"
+    st.markdown(
+        f'<span class="p2p-pill {kind}">Status: {_text(record.get("status"))}</span>'
+        f'<span class="p2p-plan-id">Plan ID: {_text(record.get("id"))}</span>',
+        unsafe_allow_html=True,
+    )
     plan_hash = record.get("plan_hash")
     if isinstance(plan_hash, str) and plan_hash:
         st.caption(f"Plan hash: {plan_hash}")
@@ -938,13 +1418,84 @@ def _render_review_identity(record: Mapping[str, Any]) -> None:
         st.caption(f"Submitted prompt: {prompt}")
 
 
+def defaults_html(notes: list[str]) -> str:
+    items = "".join(f"<li>{_text(note)}</li>" for note in notes)
+    return (
+        '<div class="p2p-defaults">'
+        f'<div class="p2p-defaults-title">ⓘ Defaults the plan used ({len(notes)})</div>'
+        '<div class="p2p-defaults-detail">The request did not say these, so the planner filled '
+        "them in. Check them before you approve, or add them to the request and generate again.</div>"
+        f"<ul>{items}</ul></div>"
+    )
+
+
+def _render_defaults(notes: object) -> None:
+    if not isinstance(notes, list):
+        return
+    items = [note for note in notes if isinstance(note, str)]
+    if items:
+        st.markdown(defaults_html(items), unsafe_allow_html=True)
+
+
+def _defaults_count(record: Mapping[str, Any]) -> int:
+    notes = record.get("defaults_applied")
+    return sum(isinstance(note, str) for note in notes) if isinstance(notes, list) else 0
+
+
+def _render_interpretation_notes(notes: object, generator: object = None) -> None:
+    if not isinstance(notes, list) or not notes:
+        return
+    with st.container(border=True):
+        if generator in (None, "mock"):
+            st.markdown("**How the request was read**")
+            st.caption(
+                "DevOps terms, typo corrections, and quantity phrasing the built-in planner "
+                "rewrote. Check them before you approve; they do not block approval."
+            )
+        else:
+            st.markdown("**Does the plan match the request?**")
+            st.caption(
+                "The built-in planner read the same request. Differences are hints for you to check. "
+                "They do not block approval."
+            )
+        for note in notes:
+            if isinstance(note, str):
+                # Plain text: notes quote model-written SKUs and regions.
+                st.text(f"• {note}")
+
+
+def formatted_json(raw: str) -> str | None:
+    """Return an indented copy of ``raw`` for reading, or None if it is not JSON.
+
+    Display only. The stored ``raw_output`` is never replaced, and the exact
+    text stays one tab away.
+    """
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return json.dumps(parsed, indent=2, ensure_ascii=False)
+
+
 def _render_raw_output(raw_output: object) -> None:
     with st.expander("Untrusted planner output", expanded=True):
-        st.caption("Stored unchanged. The planner does not validate this JSON.")
-        if isinstance(raw_output, str):
-            st.code(_exact_code(raw_output), language="json")
-        else:
+        if not isinstance(raw_output, str):
             st.text("Raw planner output is missing.")
+            return
+        formatted = formatted_json(raw_output)
+        if formatted is None:
+            st.caption("Not valid JSON, shown exactly as received. The planner does not validate it.")
+            st.code(_exact_code(raw_output), language="json", wrap_lines=True)
+            return
+        st.caption(
+            "Indented here for reading; the stored text is unchanged. "
+            "The planner does not validate this JSON."
+        )
+        formatted_tab, exact_tab = st.tabs(["Formatted", "Exact text as stored"])
+        with formatted_tab:
+            st.code(formatted, language="json", wrap_lines=True)
+        with exact_tab:
+            st.code(_exact_code(raw_output), language="json", wrap_lines=True)
 
 
 def _render_decision(record: object) -> None:
@@ -966,6 +1517,8 @@ def _render_decision(record: object) -> None:
                 "Approve sends the stored plan hash. The service checks that hash, "
                 "recomputes it, and does not save the recomputation."
             )
+        elif reason and _status_of(record) in {"draft", "evaluated"}:
+            st.markdown(f'<div class="p2p-fail-line">✗ {_text(reason)}</div>', unsafe_allow_html=True)
         elif reason:
             st.caption(reason)
         approve_col, reject_col = st.columns(2, gap="medium")
@@ -1142,22 +1695,24 @@ def _render_validation(errors: object) -> None:
 
 def _render_validation_body(errors: object) -> None:
     if not isinstance(errors, list) or not errors:
-        st.text("No validation errors.")
+        st.markdown('<span class="p2p-pass">✓ No validation errors.</span>', unsafe_allow_html=True)
         return
-    rows: list[dict[str, str]] = []
-    for issue in errors:
-        if not isinstance(issue, dict):
-            continue
-        field_path = issue.get("field_path")
-        location = f" at {field_path}" if isinstance(field_path, str) and field_path else ""
-        rows.append(
-            {
-                "Field": field_path if isinstance(field_path, str) else "",
-                "Message": f"Validation error: {issue.get('code')}{location}: {issue.get('message')}",
-            }
-        )
-    if rows:
-        st.table(rows)
+    issues = [issue for issue in errors if isinstance(issue, dict)]
+    rows = "".join(
+        "<tr>"
+        '<td class="result"><span class="p2p-fail">✗ error</span></td>'
+        f"<td>{_text(issue.get('field_path') or '')}</td>"
+        f"<td>{_text(_validation_message(issue))}</td>"
+        "</tr>"
+        for issue in issues
+    )
+    st.markdown(
+        f'<div class="p2p-fail-line">✗ {_text(_plural(len(issues), "validation error"))}. '
+        "The planner output was not used.</div>"
+        '<table class="p2p-policy p2p-errors"><thead><tr><th>Result</th><th>Field</th>'
+        f"<th>Message</th></tr></thead><tbody>{rows}</tbody></table>",
+        unsafe_allow_html=True,
+    )
 
 
 def _render_policies(checks: object) -> None:
@@ -1269,19 +1824,23 @@ def _render_cost_body(cost: object) -> None:
         if rows:
             st.table(rows)
         return
-    st.text("Cost unavailable")
     messages: list[str] = []
     if isinstance(cost, dict):
         raw_errors = cost.get("pricing_errors")
         if isinstance(raw_errors, list):
             messages.extend(item for item in raw_errors if isinstance(item, str) and item)
     if cost is None:
-        st.text("Pricing did not run.")
+        # Not a pricing failure: pricing never ran because an earlier step failed.
+        lines = ['<div class="p2p-muted-line">Cost unavailable</div>',
+                 '<div class="p2p-muted-line">Pricing did not run.</div>']
     elif messages:
-        for message in messages:
-            st.text(f"Pricing error: {message}")
+        lines = ['<div class="p2p-fail-line">✗ Cost unavailable</div>'] + [
+            f'<div class="p2p-fail">Pricing error: {_text(message)}</div>' for message in messages
+        ]
     else:
-        st.text("Pricing did not succeed.")
+        lines = ['<div class="p2p-fail-line">✗ Cost unavailable</div>',
+                 '<div class="p2p-fail">Pricing did not succeed.</div>']
+    st.markdown("".join(lines), unsafe_allow_html=True)
 
 
 def _exact_code(value: str) -> str:
@@ -1358,7 +1917,7 @@ One FastAPI process owns the rules. One Streamlit process is the client. Plan st
 | `app/artifacts.py` | Renders HCL only when the service has already approved the plan. |
 | `app/store.py` | In-memory get and put. |
 
-The planner may mention tags that happen to satisfy policy. Policy code still evaluates them. A prompt that matches no known resource, such as “build a rocket,” becomes one small web container because unrecognized words are ignored.
+The planner may mention tags that happen to satisfy policy. Policy code still evaluates them. A prompt that matches no known resource, such as “build a rocket,” becomes a draft with an `unrecognized_input` error on `resources`. The planner does not guess a resource.
 
 Data moves in one direction. The page posts the sentence. The planner returns a string. Schema, policy, and price decide. The hash is stored once. Approve and the artifact both recompute that hash and refuse the plan if it no longer matches. The Prices and Policies pages read the same JSON catalogs the checks use.
 

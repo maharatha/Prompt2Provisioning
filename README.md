@@ -2,33 +2,29 @@
 
 A local prototype that turns a plain-language infrastructure request into a reviewable deployment plan. A planner proposes JSON. Application code validates that JSON, applies policy, and prices it from a local catalog. Approval is bound to a canonical hash of the proposal. An approved plan can be rendered as a dry-run Terraform-style document.
 
-**This is a prototype.** It does not open a cloud account, read cloud credentials, or deploy infrastructure. The generated file is a fictional `main.tf`. Terraform is never executed. There is no database. Prompts, plans, decisions, and API keys are not kept after the API process stops.
+**This is a prototype.** It does not open a cloud account, read cloud credentials, or deploy infrastructure. The generated file is a fictional `main.tf`. Terraform is never executed.
+
+| | |
+|---|---|
+| **Runtime** | Python 3.12, FastAPI, Streamlit |
+| **Persistence** | A dict in one API process. No database. |
+| **Default planner** | Deterministic vocabulary matcher that fails closed on unrecognized regions and resources. Optional OpenAI or Anthropic call. |
+| **Review gate** | Schema, policy errors, and pricing must all pass, and the stored hash must still match the proposal. |
+| **Output** | Dry-run HCL using fictional `demo_*` resources. |
+
+Deeper contracts live in [ARCHITECTURE.md](ARCHITECTURE.md). This README is the document a reviewer can run from.
 
 ## What is kept
 
-Nothing you type is written to a database or to a file of plans.
-
-While the API process is running, each plan sits in a Python dictionary in that process. That is why the page can show the proposal, the decision, and the dry-run file. Stop or restart the API and that dictionary is gone. Plan ids from before the restart no longer exist. Refresh then returns **404**.
+Each plan lives in a Python dictionary inside the running API process. Stop or restart the API and every plan is gone. Old plan ids then return **404**.
 
 | Item | Where it goes |
 |---|---|
 | Prompt, proposal, decision, and dry-run file | API process memory only. Lost on restart. |
 | OpenAI or Anthropic API key | Sent with that one generate request. Not written to the plan, the logs, or disk. |
-| Log lines | Printed to the API process stderr. They name the plan id and the outcome. They omit the sentence and the key. They end when that process ends. |
-| `app/data/prices.json` and `app/data/policy.json` | Files that ship with this repository. They are the rate table and the allow-lists, not a history of requests. |
-
-The same person writes the sentence and approves or rejects it. There is no login and no second account. The downloaded `main.tf` is a file on your computer. The application does not upload it and does not run Terraform.
-
-| | |
-|---|---|
-| **Runtime** | Python 3.12, FastAPI, Streamlit |
-| **Persistence** | In-memory, one API process. A restart clears every plan. |
-| **Logs** | API process stderr. Each line names the plan id, status, and outcome. The request body, including any API key, is not logged. |
-| **Default planner** | Deterministic vocabulary matcher. Optional OpenAI or Anthropic call, key sent with that request only. |
-| **Review gate** | Schema, policy errors, and pricing must all pass, and the stored hash must still match the proposal. |
-| **Output** | Dry-run HCL using fictional `demo_*` resources. |
-
-Deeper contracts live in [ARCHITECTURE.md](ARCHITECTURE.md). This README is the document a reviewer can run from.
+| Log lines | API process stderr. They name the plan id, status, and outcome, and omit the prompt and the key. |
+| `app/data/prices.json`, `app/data/policy.json`, `app/data/lexicon.json` | Rate table, allow-lists, and planner vocabulary that ship with the repository. Not a request history. |
+| Downloaded `main.tf` | A file on your computer. The application does not upload or run it. |
 
 ## Contents
 
@@ -51,22 +47,22 @@ Deeper contracts live in [ARCHITECTURE.md](ARCHITECTURE.md). This README is the 
 
 ## What a reviewer sees
 
-One person does both steps. There is no login and no second account. The same screen writes the sentence and approves or rejects the plan.
+One person writes the request and approves or rejects it on the same screen. There is no login.
 
 1. You describe a workload, for example: *A small PostgreSQL database and two web containers for a development team in US East, optimized for low cost.*
 2. The app shows the untrusted planner JSON, the validated resources, the policy table, and a synthetic monthly price. That example evaluates to **USD 71.00**.
 3. You approve or reject that exact plan. Approve sends the stored `plan_hash`. Reject sends the plan id only.
 4. After approval, you can generate and download `main.tf`. The file states that nothing was deployed.
 
-If the wording is wrong, write a new sentence. That creates a new plan. Reject records that the current plan must not proceed. It does not edit the sentence. The two buttons are two different actions for the same person.
+If the wording is wrong, write a new sentence. That creates a new plan. Reject records that the current plan must not proceed. It does not edit the sentence.
 
-A plan that fails schema stays a `draft` and is still stored (**HTTP 201**). A plan that fails policy or pricing stays `evaluated`. Approve returns **409** in both cases. A warning, such as a medium or large SKU in development, stays visible and does not block approval.
+A plan that fails schema, or wording the planner cannot interpret, stays a `draft` and is still stored (**HTTP 201**). A plan that fails policy or pricing stays `evaluated`. Approve returns **409** in both cases. A warning, such as a medium or large SKU in development, stays visible and does not block approval.
 
 ## Start the application
 
 **Prerequisite:** Python 3.12 for a local run, or Docker with Compose.
 
-Run **one** API worker. Plan state is a dict inside that process. A second worker would not share it. Restarting the API drops every plan. The UI must request a new plan after that restart.
+Run **one** API worker. Plan state lives in that process ([What is kept](#what-is-kept)), so a second worker would not share it.
 
 ### Local, without Docker
 
@@ -131,14 +127,14 @@ Published URLs, bound to loopback only:
 | API docs | http://127.0.0.1:8000/docs |
 | UI | http://127.0.0.1:8501 |
 
-The API container runs `uvicorn` with `--workers 1`. The UI container starts after the API health check succeeds. Compose sets `API_BASE_URL=http://api:8000`. There is no database and no volume. `docker compose down` removes the containers and the network and leaves the images in place. Restarting the API container clears every plan.
+The API container runs `uvicorn` with `--workers 1`. The UI container starts after the API health check succeeds. Compose sets `API_BASE_URL=http://api:8000`. There is no volume. `docker compose down` removes the containers and the network and leaves the images in place.
 
 ### Five-minute review path
 
 With the API running:
 
 1. Open the UI and stay on **Work**.
-2. Submit the suggested prompt *Small dev database and two web containers*.
+2. Submit the request already in the box (also under **Examples** as *Dev database and two web containers*).
 3. Confirm status `evaluated`, region `us-east-1`, one `db-small` and two `container-small`, and **USD 71.00**.
 4. Choose **Approve**, then **Generate artifact**, then download `main.tf`.
 5. Open **Prices** and **Policies** to see the same catalogs the API enforces.
@@ -328,7 +324,7 @@ sequenceDiagram
 1. **Work** sends `POST /v1/plans`. The built-in planner sends the prompt only. OpenAI or Anthropic also sends `provider`, the fixed model id, and the API key.
 2. The API calls the chosen planner and stores the raw string, including when the string is invalid. The key is not stored.
 3. When the JSON matches the schema, policy and pricing run and `plan_hash` is set once. Status becomes `evaluated`, including when a policy or the price check fails. When the JSON is invalid, status stays `draft`, `proposed` is null, and policy, pricing, and hashing do not run.
-4. The page shows resources, region, tags, validation, cost, and policies in one review panel. The untrusted JSON is expandable. A green tick marks a pass. A red cross marks an error and disables Approve. A warning stays visible and leaves Approve available.
+4. The page shows resources, region, tags, validation, cost, and policies in one review panel. The untrusted JSON is expandable. Valid JSON is shown indented on a **Formatted** tab, with the stored text byte for byte on **Exact text as stored**. Text that is not JSON is shown exactly as received. Formatting is display only; `raw_output` is never rewritten. A green tick marks a pass. A red cross marks an error and disables Approve. A warning stays visible and leaves Approve available.
 5. Approve posts the stored hash. The service compares that hash with the stored hash, then recomputes a hash of the stored proposal and compares that too. The recomputed hash is not written back.
 6. Artifact generation runs only for an approved plan whose current hash still matches. The HCL is stored on the record and status becomes `artifact_generated`. Generating again is refused. Read the stored HCL with `GET /v1/plans/{plan_id}`.
 7. Approved, rejected, and artifact plans remain in the process and appear in the decision log through `GET /v1/decisions`.
@@ -372,7 +368,7 @@ stateDiagram-v2
 | `quantity` | Strict integer, 1–100. Booleans, floats, and numeric strings fail. |
 | `capacity_gb` | Required and greater than 0 for `object_storage`. Omitted for `container`, `postgres`, and `mysql`. |
 | `name`, `sku` | 1–64 characters after trim. The original string is stored. |
-| `region`, tag text | Non-blank after trim. The original string is stored. |
+| `region`, tag text | Non-blank after trim. The original string is stored. Region is at most 32 characters; each tag key and value at most 128. |
 | `sku` | A string, not an enum. An unknown SKU can be stored, and pricing then fails closed. |
 | `region` | A non-blank string. The allowed set is a policy. |
 | Tags | Blank keys and values fail schema. Which keys are required is a policy. |
@@ -439,6 +435,8 @@ Price uses `quantity`, and GB for storage. A missing type or SKU fails the whole
 
 Evaluation writes `record.plan_hash` once. Approve, reject, and artifact generation do not overwrite it. Rejection does not compute a hash.
 
+The hash covers the proposal, not the prompt. The built-in planner returns the same proposal for the same prompt, so its hash repeats. An OpenAI or Anthropic call may not, so two plans from one prompt can carry different hashes. Each is approved on its own.
+
 On approval and artifact generation the service recomputes `current_hash` and compares it with `hmac.compare_digest`. That value is not written back. If `proposed` is missing, the current hash is treated as a mismatch. Comparing only the client hash to the stored hash would accept a proposal that was changed in memory after evaluation. Both comparisons are required.
 
 Approval succeeds only when all of the following are true:
@@ -494,11 +492,11 @@ Create body:
 }
 ```
 
-`prompt` is required and must be a non-blank string. `provider` is `mock` (the default), `openai`, or `claude`. Extra fields are rejected. Blank prompts, non-strings, and invalid UUIDs are FastAPI **422** responses with a `detail` body.
+`prompt` is required and must be 30 to 2,000 characters after trimming. A prompt containing `SCENARIO:` is exempt from the minimum, because the UI sends the bare token. A shorter prompt is **422**, with a message that names the minimum. `provider` is `mock` (the default), `openai`, or `claude`. Extra fields are rejected. Blank prompts, non-strings, and invalid UUIDs are FastAPI **422** responses with a `detail` body.
 
 For `openai` or `claude`, `model` must be one of the allowlisted ids and `api_key` must be non-blank. The UI sends `gpt-5` or `claude-sonnet-5-5`. A provider failure is **422** `{ "code": "provider_error", "message" }` and is not stored. An unknown `SCENARIO:` name on the built-in planner is **422** `{ "code": "unknown_scenario", "message" }` and is not stored.
 
-`PlanRecord` fields: `id`, `prompt`, `raw_output`, `generator`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `artifact`, `created_at`, `updated_at`. `generator` is `mock` or `openai:<model>` / `claude:<model>`. `artifact` is null until generation. `raw_output` is the untrusted generator string so the UI can show it.
+`PlanRecord` fields: `id`, `prompt`, `raw_output`, `generator`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `interpretation_notes`, `artifact`, `created_at`, `updated_at`. `generator` is `mock` or `openai:<model>` / `claude:<model>`. `interpretation_notes` lists the built-in planner's rewrites, or, for a model plan, its differences from the built-in reading (see [Guardrails on model output](#guardrails-on-model-output)). `defaults_applied` lists every value the request did not state, for any planner. Examples: *"Region: the request names none, so the plan uses us-east-1."*, *"Size: none given for web (container), so it uses container-small, the smallest tier."*, and owner or cost-center tags the request did not name. When a request names an owner, the built-in planner says it did not read it. Both lists are empty for drafts and `SCENARIO:` fixtures. Neither is policy, an approval gate, or part of the hash. The Work page shows defaults in a blue **Defaults the plan used** box, and the review banner gives their count. `artifact` is null until generation. `raw_output` is the untrusted generator string so the UI can show it.
 
 Service errors are `{ "code", "message" }` only. Responses do not include stack traces. Common **409** codes: `status`, `submitted_hash`, `current_hash`, `validation_errors`, `policy_error`, `pricing`, `missing_proposal`, `missing_plan_hash`.
 
@@ -514,9 +512,21 @@ Service errors are `{ "code", "message" }` only. Responses do not include stack 
 | Policies | The allow-lists from `GET /v1/catalog/policy` |
 | Read me | A short in-app explanation of the same flow |
 
-The request field has a **Suggested prompts** control, including the USD 71.00 example, a medium development database (warning, approve stays available), production containers in US West, Azure East US storage, and wording the built-in planner does not recognize.
+The **Examples** menu beside the request box lists sample requests grouped by what happens to them. Each one says what to look for. Choosing one fills the request box and clears any demo scenario.
+
+| Group | Examples | What it shows |
+|---|---|---|
+| Approvable | Dev database and two web containers; production web tier in US West; storage in Azure East US | Every check passes. USD 71.00, 54.00, and 2.50 a month. `eastus2` is kept as written. |
+| Approvable with a warning | Medium database in development | `dev_medium_cost` warns, and Approve stays available. |
+| Blocked by a policy | Six web containers | Plain wording reaches a policy error: `resource_limits` allows at most 5. |
+| Stays a draft | A region the app does not know (*US North*); nothing the planner recognizes (*build a rocket*) | The built-in planner refuses to guess. |
+| Loose wording | Typos and slang (*a couple of app boxes and a postgress instance on the east coast for QA*) | The built-in planner returns a draft. Run it with OpenAI or Anthropic to compare. |
+
+A UI test sends every example through the real plan service and checks the stated outcome and price, so this table cannot drift from the app.
 
 The planner control offers **Built-in**, **OpenAI**, and **Anthropic**. The model id is fixed for each provider. The API key is a password field, is sent only on that generate request, and is not written to the plan, logs, or disk.
+
+**Generate plan** is always the coloured primary button. It is disabled until the request has at least 30 characters, or a demo scenario is selected. A line under the box shows *"✓ 66 characters"* or *"✗ 14 of 30 characters. Add 16 more…"*. Both update **as you type**. Streamlit only sends a text box's value on Ctrl+Enter or blur, so a small script installed in the page (`LIVE_PROMPT_SCRIPT` in `ui/app.py`) updates them on each keystroke and after each redraw. The server never disables the button itself, because React would then swallow the first click after typing. If the script does not run, `_on_generate` still refuses a short request with a message, and the API returns **422**. While a plan is being generated, a full-screen overlay dims the page and shows a centred spinner. For OpenAI or Anthropic it names the model and says the reply can take up to a minute, so a slow model call does not look like a frozen page.
 
 Approve is disabled when the record has validation errors, a policy `error`, or pricing that did not succeed. Generate artifact and download `main.tf` appear after approval. The file body is the record's `artifact` field. Streamlit's header includes its theme control: light, dark, or the system default.
 
@@ -526,25 +536,57 @@ Both planners are untrusted proposal generators. The checks after them are the s
 
 ### Built-in
 
-`MockPlanner` matches a fixed vocabulary. It does not guess.
+`MockPlanner` is deterministic. It is not a language model. It reads a request in two passes:
 
-| Phrase | Result |
+1. **Normalize** ([app/lexicon.py](app/lexicon.py), vocabulary in [app/data/lexicon.json](app/data/lexicon.json)). This pass rewrites DevOps wording into the planner's own words:
+   - **Synonyms.** `rds`, `aurora postgres`, `cloud sql`, `pg` → PostgreSQL. `mariadb`, `rds mysql` → MySQL. `pods`, `api`, `microservices`, `fargate`, `backend`, `web app`, `workers` → container. `bucket`, `gcs`, `minio` → object storage. `uat`, `preprod`, `stg` → test. `prd` → prod. `sandbox` → dev. `iad`, `virginia`, `east coast` → us-east-1. `pdx`, `west coast`, `us-west` → us-west-2. `tiny`, `xs` → small. `midsize` → medium. `beefy`, `huge` → large.
+   - **Quantity phrasing.** `api x3`, `3x api`, `3 replicas of the api`, and `api with 3 instances` all mean 3 containers.
+   - **Typos.** A word of six or more letters that is exactly **one edit** (Damerau-Levenshtein: one wrong, missing, extra, or swapped letter) from a distinctive planner word is corrected: `dataabse` → database, `postgress`, `contaner`, `prodution`, `virgina`. A word of six or more letters **two edits** from a resource noun is refused with a suggestion (`dataabes`, `datbse`). Anything else is ignored.
+   - **Unsupported things are refused, not dropped.** `redis`, `kafka`, `ec2`, `vm`, `lambda`, `load balancer`, `dynamodb`, and others return *"This prototype cannot provision the resource 'redis'"*. Regions outside the allow-list, such as `Frankfurt`, `Europe`, `us-east-2`, and `ohio`, return *"Unrecognized region"* instead of quietly becoming us-east-1.
+2. **Parse** the normalized text with the fixed vocabulary below.
+
+**Every rewrite is shown.** For a built-in plan, `interpretation_notes` lists each one: *"Read 'rds' as PostgreSQL (DevOps term)."*, *"Read 'dataabse' as 'database' (likely typo, one letter off)."*, *"Read 'api x3' as quantity 3."* The Work page shows them under **How the request was read**. The rule is: **correct only when the meaning is unambiguous, always show the correction, and refuse otherwise.**
+
+Edit distance cannot tell a typo from a real word: *staying* is one edit from *staging*, and *backed* is one edit from *backend*. So the typo targets are a short list chosen to have no common English word nearby. A scan of 25,000 distinct words found no harmful corrections. The look-alikes it found are pinned in [tests/test_lexicon.py](tests/test_lexicon.py), and `not_typos` in the lexicon lists the exceptions. [tests/planner_cases.json](tests/planner_cases.json) holds 50 realistic DevOps requests with the plan or refusal each must produce. Add a case there whenever the lexicon changes.
+
+| Phrase (after normalization) | Result |
 |---|---|
-| postgres, postgresql, database | `postgres` |
-| mysql, mysql database | `mysql` |
-| container, web container, web application, website | `container` |
+| postgres, postgresql, database, db | `postgres` |
+| mysql, mysql database, mysql db | `mysql` |
+| container, web container, web application, website, app server | `container` |
 | object storage, blob storage, s3 | `object_storage` |
 | dev, development | environment `dev` |
-| test | environment `test` |
+| test, staging, qa | environment `test` |
 | prod, production | environment `prod` |
 | US East, East US, Northern Virginia, `us-east-1` | `us-east-1` |
 | US West, Oregon, `us-west-2` | `us-west-2` |
 | Azure East US, East US 2, `eastus2` | `eastus2` |
 | small, medium, big, large | matching SKU tier |
-| one, single, two, pair, couple, three, or a number | quantity |
-| `N GB` or `N gigabytes` | storage `capacity_gb` |
+| one … ten, single, pair, couple, dozen, or a number | quantity |
+| `N GB`, `N gigabytes`, `N TB`, `N terabytes` | storage `capacity_gb` (1 TB = 1000 GB) |
+| no, not, without, don't need *before* a resource | that resource is left out |
 
-`big` and `large` stay on the large SKU. `low cost` keeps the small default and does not replace an explicit size. A prompt with no region phrase uses `us-east-1`. A prompt with no recognized resource still returns one small web container. A different single-space `US` or `Azure` region, such as `US NORTH`, is an interpretation error. That draft has no proposed plan and cannot be approved. Tags on a recognized plan are `environment`, `owner=dev-team`, and `cost-center=engineering`. Policy code still checks those tags. The planner does not certify compliance.
+How a sentence is read:
+
+- Size, quantity, and capacity bind to the next resource phrase. They are read from the text between the previous resource phrase and this one.
+- Region phrases are blanked before quantities are read, so the `2` in `us-west-2` is not a count.
+- `big` and `large` both mean the large SKU. `low cost` keeps the small default and does not replace an explicit size.
+- A prompt with no region phrase uses `us-east-1`. `US North`, `US Central`, or an unknown `Azure …` phrase is an interpretation error, not a guess. "Give **us** two containers" is ordinary text.
+- A prompt with no recognized resource, or one that negates every resource it names, is an interpretation error on `resources`. It is not turned into a default container.
+- A typo cannot silently drop a resource. *"I want a dataabse and container"* becomes a database and a container, with the correction listed. A misspelling too far to correct safely is refused, even when other resources were recognized.
+- Tags on a recognized plan are `environment`, `owner=dev-team`, and `cost-center=engineering`. Policy code still checks them. The planner does not certify compliance.
+
+An interpretation error is a draft with an `unrecognized_input` validation issue. It has no proposed plan and cannot be approved.
+
+Not understood on purpose, because the planner would have to guess:
+- paraphrase without a resource word (*"somewhere to keep customer records"*)
+- `aurora` or `rds` without an engine (read as PostgreSQL, and shown)
+- `HA` or "highly available" as a replica count
+- capacity written after the noun (*"a bucket of 50 GB"* uses the 100 GB default)
+- owner or cost-center taken from the prompt
+- `storage` without `object` or `blob`
+
+Use the OpenAI or Anthropic planner for looser wording; its output goes through the same checks.
 
 `SCENARIO:<name>` skips vocabulary parsing and returns a fixed string. The string is not repaired. Names, with aliases the planner also accepts:
 
@@ -557,14 +599,55 @@ Both planners are untrusted proposal generators. The checks after them are the s
 | `unsupported_sku` | Schema-valid SKU missing from the catalog |
 | `excessive_qty` | Quantity over the policy cap |
 | `public_storage` | Object storage with public access |
+| `extra_fields` | A valid plan that also claims `"status": "approved"` and a zero `cost`. Schema rejects both fields (`extra_forbidden`), so the plan stays a draft |
+| `bad_region` | A valid plan in `eu-west-1`. It prices, but `allowed_regions` blocks approval |
 
-An unknown name is **422** `unknown_scenario` and is not stored. Scenarios apply to the built-in planner.
+Every layer has at least one scenario: JSON (`malformed`), schema (`missing_region`, `unknown_type`, `extra_fields`), policy (`missing_tags`, `excessive_qty`, `public_storage`, `bad_region`), and pricing (`unsupported_sku`). None of them can be approved. For a warning that does not block approval, use the *Medium database in development* example.
+
+An unknown name is **422** `unknown_scenario` and is not stored. Scenarios apply to the built-in planner only. The Work page hides the scenario selector when OpenAI or Anthropic is chosen. A selected scenario sends only `SCENARIO:<name>`, not the request text, because the planner ignores that text.
 
 ### OpenAI and Anthropic
 
 The Work page can send the same prompt to OpenAI (`gpt-5`) or Anthropic (`claude-sonnet-5-5`). The API allowlist is wider (`gpt-4.1-mini`, `gpt-4.1`, `gpt-5-mini`, `gpt-5`, `claude-haiku-4-5`, `claude-sonnet-5-5`, `claude-opus-5-5`) for callers that set `model` themselves. The UI has no model menu.
 
 The model is asked to interpret typos and synonyms and to keep an explicit request even when a later check will fail. The brief is built from the live region list and price catalog. It does not ask the model to satisfy policy. The returned text is still one untrusted string. A provider timeout or transport failure is **422** `provider_error` and is not stored. The key is absent from the stored record and from the error message.
+
+Turning a sentence into a small JSON plan is simple extraction, so both calls ask for **low reasoning effort**: Claude `output_config.effort: "low"` on Sonnet 5.5 and Opus 5.5, and OpenAI `reasoning_effort: "low"` on gpt-5 models. Haiku 4.5 and gpt-4.1 models reject those settings, so they are not sent there. Low effort is much faster, and every plan is still checked afterwards. The API logs each call's duration, for example `model call provider=claude model=claude-sonnet-5-5 model_ms=4210 outcome=ok`, without the prompt or key, so slow responses can be traced to the provider rather than guessed at.
+
+Both calls ask for JSON only, so a reply wrapped in prose or Markdown fences does not turn an otherwise good answer into a `json_invalid` draft:
+
+- OpenAI uses JSON mode (`response_format: {"type": "json_object"}`).
+- Claude uses a structured-output schema (`output_config.format`, see `PLAN_OUTPUT_SCHEMA` in `app/llm.py`). That schema is looser than `ProposedPlan`, because structured outputs accept only closed objects and no numeric or length limits. Quantity has no range there, `capacity_gb` is optional on every type, and tags can only be `environment`, `owner`, and `cost-center`, each optional.
+
+This limits what the model writes. It is not repair: the application never strips, trims, or rewrites the returned text, and Pydantic still enforces the full schema.
+
+What this means when you read a model plan:
+
+- **Tags come from defaults.** The brief tells the model to use `owner=dev-team` and `cost-center=engineering` when the prompt names neither, just as the built-in planner does. A `required_tags` pass on a model plan therefore says the keys are present. It does not say the person supplied them. Use `SCENARIO:missing_tags` to see that policy fail.
+- **Plans are not repeatable.** The same prompt can produce a different plan and a different `plan_hash` on each call. Approval is unaffected, because the hash is bound to the stored proposal, not to the prompt. Each generate is a new plan to review.
+
+#### Guardrails on model output
+
+Instructions to the model are not a control. A prompt can talk a model out of them. The controls are the limits on what the model can do and the checks on everything it returns:
+
+| Risk | Guardrail |
+|---|---|
+| The model takes an action | It has no tools. It returns one string, and nothing executes it. |
+| The key leaks | The key goes only in a request header, never in the model's input, and is redacted from provider errors. |
+| The call is redirected | Fixed provider URLs and an allowlist of model ids. |
+| Oversized input | `prompt` is at most 2,000 characters (**422**). |
+| Oversized output | A reply over 32 KB is a `provider_error` and is not stored. Claude also has a 16,000-token cap. |
+| A refused or cut-off reply | Claude `stop_reason` `refusal` / `max_tokens` and OpenAI `finish_reason` `content_filter` / `length` become a clear `provider_error`, not a confusing `json_invalid` draft. |
+| The model skips steps (`"status": "approved"`, a cost, a hash) | `extra="forbid"` rejects the plan. |
+| Invented regions, SKUs, or types | Schema, policies, and pricing fail closed. |
+| Huge or hostile strings | Name and SKU are capped at 64 characters, region at 32, each tag key and value at 128. HCL and UI HTML are escaped. Logs omit the prompt. |
+| A valid plan that is not what was asked | **Interpretation notes** (below). The person approves the exact plan shown. |
+
+**Interpretation notes.** After a model plan passes the schema, the service runs the built-in planner on the same prompt and lists each difference: region, environment, and each resource type's quantity, SKU, and capacity. Examples: *"object_storage: the model added 1 × storage-standard (100 GB); the request may not ask for it."* or *"postgres: the model left out 1 × db-small, which the built-in reading found."* A plan with no differences says so. When the built-in planner cannot read the prompt (unknown wording or a `SCENARIO:` token), the note says the plan was not compared.
+
+The notes are hints, not policy. The built-in vocabulary is narrow, so a difference means "check this line", not "the model is wrong". They never block approval and are not part of `plan_hash`. The Work page shows them as plain text under **Does the plan match the request?**
+
+Prompt injection ("ignore your instructions and…") can only change the JSON. That JSON still passes every check above and the reviewer still approves it. In this prototype the requester and the approver are the same person, so an injected prompt gains nothing that person could not type directly.
 
 ## Repository layout
 
@@ -583,6 +666,7 @@ The model is asked to interpret typos and synonyms and to keep an explicit reque
 │   ├── services.py          # state transitions
 │   ├── store.py             # in-memory records
 │   ├── planner.py           # built-in generator
+│   ├── lexicon.py           # DevOps synonyms, quantity phrasing, typo correction
 │   ├── llm.py               # optional model call
 │   ├── validation.py
 │   ├── policies.py
@@ -591,6 +675,7 @@ The model is asked to interpret typos and synonyms and to keep an explicit reque
 │   ├── artifacts.py
 │   ├── data/prices.json
 │   ├── data/policy.json
+│   ├── data/lexicon.json    # DevOps vocabulary for the built-in planner
 │   └── templates/main.tf.j2
 ├── ui/app.py
 ├── docs/button-flow.html
@@ -607,7 +692,7 @@ python -m pytest
 
 Tests use FastAPI `TestClient` and inject an empty `InMemoryStore` through `dependency_overrides`. They assert HTTP status, stored status, validation errors, policy rows, decimal totals, hash mismatch, and rendered text. They do not require Docker.
 
-Coverage includes a valid generated plan, malformed JSON, missing fields, unexpected fields, an unsupported region, missing tags, public object storage, excessive quantity, excessive storage, an unknown SKU, the decimal totals, a warning that does not block approval, errors that do, a wrong submitted hash, a proposal changed after evaluation, a proposal changed after approval and before render, a rejected plan that cannot render, two identical renders, catalog and decision routes, the optional provider boundary, and the health endpoint.
+Coverage includes a valid generated plan, malformed JSON, missing fields, unexpected fields, an unsupported region, missing tags, public object storage, excessive quantity, excessive storage, an unknown SKU, the decimal totals, a warning that does not block approval, errors that do, a wrong submitted hash, a proposal changed after evaluation, a proposal changed after approval and before render, a rejected plan that cannot render, two identical renders, planner wording (unrecognized resources, negation, region digits, the word "us", number words, synonyms, TB), catalog and decision routes, the optional provider boundary (key redaction, OpenAI JSON mode, a Claude output schema that uses only closed objects, refused, cut-off, and oversized replies, the prompt length limit, and interpretation notes), and the health endpoint.
 
 ## Design boundaries
 

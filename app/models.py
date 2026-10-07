@@ -44,6 +44,10 @@ class CheckStatus(StrEnum):
     ERROR = "error"
 
 
+MAX_REGION_CHARS = 32
+MAX_TAG_CHARS = 128
+
+
 def _require_trimmed_length(value: str, *, field_name: str, min_len: int, max_len: int) -> str:
     stripped_len = len(value.strip())
     if stripped_len < min_len or stripped_len > max_len:
@@ -106,7 +110,10 @@ class ProposedPlan(BaseModel):
     @field_validator("region")
     @classmethod
     def validate_region(cls, value: str) -> str:
-        return _require_nonblank(value, field_name="region")
+        _require_nonblank(value, field_name="region")
+        if len(value) > MAX_REGION_CHARS:
+            raise ValueError(f"region must be at most {MAX_REGION_CHARS} characters")
+        return value
 
     @field_validator("tags")
     @classmethod
@@ -116,6 +123,10 @@ class ProposedPlan(BaseModel):
                 raise ValueError("tag keys must be nonblank")
             if value.strip() == "":
                 raise ValueError("tag values must be nonblank")
+            if len(key) > MAX_TAG_CHARS:
+                raise ValueError(f"tag keys must be at most {MAX_TAG_CHARS} characters")
+            if len(value) > MAX_TAG_CHARS:
+                raise ValueError(f"tag values must be at most {MAX_TAG_CHARS} characters")
         return tags
 
 
@@ -192,6 +203,8 @@ class PlanRecord(BaseModel):
     validation_errors: list[ValidationIssue] = Field(default_factory=list)
     policy_checks: list[PolicyCheck] = Field(default_factory=list)
     cost: CostEstimate | None = None
+    interpretation_notes: list[str] = Field(default_factory=list)
+    defaults_applied: list[str] = Field(default_factory=list)
     artifact: str | None = None
     created_at: AwareDatetime = Field(default_factory=utc_now)
     updated_at: AwareDatetime = Field(default_factory=utc_now)

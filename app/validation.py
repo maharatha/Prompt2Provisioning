@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from app.models import ProposedPlan, ValidationIssue
 
 _VALUE_ERROR_PREFIX = "Value error, "
+_INTERPRETATION_FIELDS = frozenset({"region", "resources"})
 
 
 @dataclass(frozen=True)
@@ -50,7 +51,9 @@ def _interpretation_issue(payload: object) -> ValidationIssue | None:
     message = payload.get("interpretation_error")
     if not isinstance(message, str) or message.strip() == "":
         return None
-    return ValidationIssue(code="unrecognized_input", message=message, field_path="region")
+    field = payload.get("interpretation_field")
+    field_path = field if field in _INTERPRETATION_FIELDS else "region"
+    return ValidationIssue(code="unrecognized_input", message=message, field_path=field_path)
 
 
 def _failure(*issues: ValidationIssue) -> ValidationResult:

@@ -21,7 +21,7 @@ Required:
 - Deterministic mock planner by default
 - Docker Compose for local API + UI
 
-Do not require: a real LLM, paid APIs, cloud credentials, a cloud account, Terraform CLI, a database, authentication, Kubernetes, or a message broker.
+Do not require: a real LLM (an optional adapter is allowed; see Architecture), paid APIs, cloud credentials, a cloud account, Terraform CLI, a database, authentication, Kubernetes, or a message broker.
 
 Packaging: `requirements.txt` at the repo root. Do not introduce a `src/` layout, Alembic, or a multi-package workspace.
 
@@ -41,6 +41,8 @@ app/
   models.py            # Pydantic models and enums
   store.py             # InMemoryStore
   planner.py           # mock LLM; returns str only
+  lexicon.py           # rewrites DevOps wording for planner.py; text only
+  llm.py               # optional OpenAI / Anthropic call; returns str only
   validation.py        # JSON parse + schema
   policies.py          # policy functions; never mutate the plan
   pricing.py           # Decimal estimates from local catalog
@@ -70,14 +72,22 @@ Do not add `core/domain/infrastructure` folders, repository interfaces, or a sec
 - Business logic lives in `services.py` and the small modules it calls. Route handlers validate HTTP input, call the service, and map results to status codes.
 - Persistence is a single in-memory dict keyed by plan id. A restart clears state; the UI must not assume ids survive process restart.
 - Create and evaluate in **one** `POST /v1/plans`. No PATCH/edit API. Tests that need mutation write the store directly.
-- Optional replaceable boundary: a ~5-line `Planner` Protocol with `generate(prompt: str) -> str`. Default implementation: `MockPlanner`. Do not implement a real LLM client in this prototype.
+- Optional replaceable boundary: a ~5-line `Planner` Protocol with `generate(prompt: str) -> str`. Default implementation: `MockPlanner`. It stays the default, and every test runs without a key.
+- Optional model adapter (`llm.py`): one HTTP call through `httpx` to an allowlisted OpenAI or Anthropic model, chosen per request. Rules:
+  - The caller supplies the API key on that request. Never store it on the record, log it, or write it to disk. Redact it from provider error text.
+  - The adapter returns one raw string, which is as untrusted as mock output. The same validation, policy, pricing, and hash checks apply.
+  - Ask the provider for JSON only (OpenAI JSON mode, Claude `output_config.format` JSON schema). That limits what the model may write. Never strip fences, parse partial output, or otherwise repair the returned text.
+  - Reject a reply over 32 KB, or one the provider marks as refused or cut off, as a `provider_error`, and store nothing.
+  - Tests use `httpx.MockTransport`. No test calls a real provider.
 - Do not add repository interfaces, policy DSLs, queues, event buses, cloud SDKs, background jobs, or microservices.
 
 ### Module trust table
 
 | Module | May do | Must not do |
 |---|---|---|
-| `planner.py` | Return a JSON **string** | Validate, score policy, price, approve, write artifacts, repair JSON |
+| `planner.py` | Return a JSON **string**; `explain()` lists every rewrite it applied | Validate, score policy, price, approve, write artifacts, repair JSON |
+| `lexicon.py` | Rewrite request text using `data/lexicon.json`; correct only one-edit typos of listed distinctive words; record every rewrite | Correct silently; correct toward words with a common English word one edit away; build or validate plans |
+| `llm.py` | Return the provider's text **string**; ask for JSON-only output | Store or log the key; repair, strip, or validate the text; be the default |
 | `validation.py` | `json.loads` + `ProposedPlan.model_validate` | Mutate or default invalid fields |
 | `policies.py` | Return policy results | Change the plan |
 | `pricing.py` | Sum catalog prices with Decimal | Approve or generate IaC; skip unpriced lines |
@@ -88,7 +98,7 @@ Do not add `core/domain/infrastructure` folders, repository interfaces, or a sec
 
 ## AI trust boundary
 
-The mock planner (and any future LLM) is an **untrusted proposal generator**.
+The mock planner and the optional model adapter are both **untrusted proposal generators**.
 
 - The planner may return **only** a raw JSON string.
 - It must not validate schema, enforce policies, calculate authoritative cost, approve plans, or generate artifacts.
@@ -146,6 +156,10 @@ Required scenario names:
 - `unsupported_sku`
 - `excessive_qty`
 - `public_storage`
+- `extra_fields` (claims `status` and `cost`; must fail schema)
+- `bad_region` (`eu-west-1`; must fail `allowed_regions` only)
+
+No scenario may produce an approvable plan. The UI shows the scenario selector only for the built-in planner and sends the bare token.
 
 Happy-path example prompt: “A small PostgreSQL database and two web containers for a development team in US East, optimized for low cost.”
 
@@ -270,7 +284,7 @@ Base path `/v1`. JSON only. No authentication. Run one API worker. Handlers call
 | `GET` | `/v1/schema/plan` | `ProposedPlan.model_json_schema()`. |
 | `GET` | `/health` | `{ "status": "ok", "service": "prompt-to-provisioning-planner" }`. |
 
-Plan routes return `PlanRecord`: `id`, `prompt`, `raw_output`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `artifact`, `created_at`, `updated_at`. Include `raw_output` so the UI can show untrusted JSON. `artifact` is null until generation. Currency amounts are JSON strings from Pydantic, not floats. Request-body and UUID failures use FastAPI's **422** `detail` body. Service errors contain only `code` and `message`, with no stack trace.
+Plan routes return `PlanRecord`: `id`, `prompt`, `raw_output`, `generator`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `interpretation_notes`, `defaults_applied`, `artifact`, `created_at`, `updated_at`. Include `raw_output` so the UI can show untrusted JSON. `prompt` is at most 2,000 characters. `interpretation_notes` lists differences between a model plan and the built-in planner's reading of the same prompt. Keep it a reviewer hint: never a policy result, never an approval gate, never part of the hash, and rendered as plain text. `defaults_applied` follows the same rules. It names every region, environment, size, storage capacity, and owner or cost-center tag the plan filled in because the request did not state it. Never apply a default without listing it there. `artifact` is null until generation. Currency amounts are JSON strings from Pydantic, not floats. Request-body and UUID failures use FastAPI's **422** `detail` body. Service errors contain only `code` and `message`, with no stack trace.
 
 ## Streamlit
 
@@ -355,4 +369,4 @@ The README must explain: AI trust boundary; architecture and request lifecycle; 
 
 ## Explicitly out of scope
 
-Real LLM adapters, cloud SDKs, Terraform CLI, databases, auth, Kubernetes, queues, plan-editing UI, real `aws_*` / `azurerm_*` resources, Bicep, cost-optimization solvers, policy-as-code languages, durable persistence, webhooks, CI deploy pipelines.
+A required or default real LLM, LLM SDKs, retries or agent loops around the model call, cloud SDKs, Terraform CLI, databases, auth, Kubernetes, queues, plan-editing UI, real `aws_*` / `azurerm_*` resources, Bicep, cost-optimization solvers, policy-as-code languages, durable persistence, webhooks, CI deploy pipelines.
