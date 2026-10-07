@@ -61,7 +61,7 @@ flowchart LR
 
 Everything to the right of the planner is trusted application code. The planner may emit tags that happen to satisfy policy; policy code still evaluates them. Generator output is never normalized to make it pass.
 
-Malformed JSON, extra fields, missing fields, and type errors are stored as validation errors on a `draft` record with `approval_blocked=true`. The create call still returns **201**. That outcome is part of the contract, because the generator is not a trusted client.
+Malformed JSON, extra fields, missing fields, and type errors are stored as validation errors on a `draft` record. The create call still returns **201**. That outcome is part of the contract, because the generator is not a trusted client. Approval of that draft returns **409**.
 
 ## Components
 
@@ -106,7 +106,7 @@ Flat layout under `app/`, `ui/`, and `tests/`. No `src/` tree, no domain/infrast
 5. If the schema passes, policies and pricing run, then `plan_hash` is set once. Status becomes `evaluated` even when a policy or the price check fails.
 6. The UI shows the raw JSON, the validated plan, the policy table, and the synthetic cost.
 7. Approve submits the `plan_hash` from that response. Reject submits the plan id only.
-8. Artifact generation runs only after approval and a second hash check. It stores the HCL and sets `artifact_generated`. A rejected plan cannot generate an artifact.
+8. Artifact generation runs only after approval and a second hash check. It stores the HCL on the record and sets `artifact_generated`. The artifact route returns that updated record. A rejected plan cannot generate an artifact. Generating again is refused; the stored HCL is read with `GET /v1/plans/{plan_id}`.
 
 Vocabulary covers postgres/database, container/web application, object storage, dev/test/prod, US East → `us-east-1`, US West → `us-west-2`, Azure East US → `eastus2`, small/medium/low cost, and quantities one/two/three.
 
@@ -132,11 +132,9 @@ stateDiagram-v2
 | `evaluated` | Approve when every approval gate passes, or reject | Artifact |
 | `approved` | Artifact when the current hash still matches | Approve again, reject |
 | `rejected` | None | Approve, reject, artifact |
-| `artifact_generated` | Return the stored artifact when the hash still matches | Approve again, reject |
+| `artifact_generated` | Read the stored record, including `artifact` | Approve again, reject, generate again |
 
-A policy error or a pricing failure does not push the record back to `draft`. The record stays `evaluated` and `approval_blocked` is true. A warning does not block. Clients must use `approval_blocked`. `status == evaluated` is not sufficient to enable approval.
-
-`approval_blocked` is derived: any validation error, any policy `error`, or a pricing failure. It is not a column on the stored record.
+A policy error or a pricing failure leaves the record `evaluated`. A warning does not block approval. Callers read validation errors, policy statuses, and `cost.succeeded` on the `PlanRecord`. `status == evaluated` alone does not mean approve will succeed. Any validation error, policy `error`, or pricing failure makes approve return **409**. The plan response has no `approval_blocked` field, and that condition is not a column on the stored record.
 
 ## Approval and integrity
 
@@ -165,7 +163,7 @@ The submitted hash ties the reviewer to the evaluation they were shown. The reco
 
 Rejection requires the plan id and no submitted hash. `draft` and `evaluated` may become `rejected`. The proposal, hash, and evaluation results stay as stored. Rejection does not apply the approval gates. `approved`, `rejected`, and `artifact_generated` cannot be rejected. A rejected plan cannot be approved.
 
-Artifact generation requires `approved`, or `artifact_generated` when returning an already rendered file, and requires `current_hash == plan_hash`. Hash drift after approval returns **409** and does not render. A rejected plan cannot generate an artifact.
+Artifact generation requires `approved` and `current_hash == plan_hash`. The route returns the updated `PlanRecord`, with the HCL in `artifact`. Hash drift after approval returns **409** and does not render. A rejected plan cannot generate an artifact. A plan that is already `artifact_generated` is refused with **409**; clients read the saved HCL from the stored record.
 
 Unknown ids are **404**. Illegal transitions are **409** and name the gate that failed. Error responses do not include stack traces.
 
@@ -210,16 +208,19 @@ Base path `/v1`. JSON. No authentication.
 
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/v1/plans` | Create and evaluate. **201**, including drafts that failed validation. |
-| `GET` | `/v1/plans/{id}` | **200** or **404**. |
-| `POST` | `/v1/plans/{id}/approve` | Body `{ "plan_hash": str }`. **409** when any approval gate fails. |
-| `POST` | `/v1/plans/{id}/reject` | No body. The plan id is the only input. `draft` or `evaluated` becomes `rejected` and keeps the proposal, hash, and evaluation results. **409** for `approved`, `rejected`, or `artifact_generated`. |
-| `POST` | `/v1/plans/{id}/artifact` | No body. Returns `{ "format": "terraform", "content": str, "filename": "main.tf" }`. Refused for a rejected plan. |
-| `GET` | `/health` | `{ "status": "ok" }`. |
+| `POST` | `/v1/plans` | Create and evaluate. **201** `PlanRecord`, including drafts that failed validation. Unknown `SCENARIO:` names are **422** `{ "code": "unknown_scenario", "message" }` and are not stored. |
+| `GET` | `/v1/plans/{plan_id}` | **200** `PlanRecord`, or **404** `{ "code": "not_found", "message" }`. |
+| `POST` | `/v1/plans/{plan_id}/approve` | Body `{ "plan_hash": str }`. **200** updated `PlanRecord`. **409** `{ "code", "message" }` when any approval gate fails. The service checks hash format. |
+| `POST` | `/v1/plans/{plan_id}/reject` | No body. The plan id is the only input. `draft` or `evaluated` becomes `rejected` and keeps the proposal, hash, and evaluation results. **200** updated `PlanRecord`. **409** for `approved`, `rejected`, or `artifact_generated`. |
+| `POST` | `/v1/plans/{plan_id}/artifact` | No body. **200** updated `PlanRecord` with the HCL in `artifact`. **409** when refused, including a rejected plan or a repeated call. |
+| `GET` | `/v1/schema/plan` | `ProposedPlan.model_json_schema()`. |
+| `GET` | `/health` | `{ "status": "ok", "service": "prompt-to-provisioning-planner" }`. |
 
-Public plan fields: `id`, `prompt`, `raw_output`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `approval_blocked`, `artifact_available`. `raw_output` is the untrusted generator string. The HCL body is returned by the artifact route, not embedded in the plan payload.
+Plan routes return `PlanRecord`: `id`, `prompt`, `raw_output`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `artifact`, `created_at`, `updated_at`. `raw_output` is the untrusted generator string. `artifact` is null until generation and is included on the record after the artifact route succeeds. Later reads use the same record. Currency amounts are JSON strings from Pydantic, not floats. Blank prompts, extra request fields, non-string values, and invalid UUIDs use FastAPI's **422** `detail` body. Service errors contain only `code` and `message`, with no stack trace.
 
-Streamlit disables approve while `approval_blocked` is true, sends the stored hash on approve, rejects with the plan id only, and offers `main.tf` only after approval.
+Run one API worker. Route handlers are async and call the service synchronously, with no await during a transition. The store is not locked.
+
+Streamlit disables approve when the record has validation errors, a policy `error`, or pricing that did not succeed. It sends the stored hash on approve, rejects with the plan id only, and offers `main.tf` from the record's `artifact` field only after approval.
 
 Tests that must change a proposal after evaluation write the store directly. They do not go through an edit API.
 
@@ -227,7 +228,7 @@ Tests that must change a proposal after evaluation write the store directly. The
 
 `InMemoryStore` is a `dict` keyed by plan id. `create`, `get`, and `update` return deep copies, so a caller cannot change the stored plan by mutating the object it received. `update` keeps the original `created_at` and sets `updated_at`. Creating an id that already exists is an error. Updating a missing id is an error. Get of a missing id returns no record, which the API maps to **404**.
 
-Deep copies stop accidental aliasing. They are not a lock and not a durability mechanism. The hash check is what detects a proposal that was intentionally replaced after evaluation. Restarting the API drops every plan. The UI must not assume an id survives a process restart.
+Deep copies stop accidental aliasing. They are not a lock and not a durability mechanism. Run one API worker so requests do not share this dict across processes. The hash check is what detects a proposal that was intentionally replaced after evaluation. Restarting the API drops every plan. The UI must not assume an id survives a process restart.
 
 ## Test strategy
 
@@ -249,10 +250,15 @@ Prompt one slice at a time, and include that slice’s tests in the same prompt:
 
 ## Open decisions
 
-These are the only items not fixed above. Resolve each inside the slice that needs it. Do not introduce a new component to settle them.
+Resolve each remaining item inside the slice that needs it. Do not introduce a new component to settle them.
 
-- **Error body.** **404** and **409** are fixed, and a **409** names the failed gate without a stack trace. The JSON fields of that error body are not specified.
+Resolved by the API routes:
+
+- **Error body.** **404** and **409** return `{ "code", "message" }`. The `code` is the failed gate (`not_found` for a missing plan). The message includes that same code and no stack trace. Unknown scenario names return **422** with the same two fields and `code` `unknown_scenario`. Request validation uses FastAPI's **422** `detail` body.
+- **Decimal encoding.** The API serializes `Decimal` money through Pydantic JSON as strings and does not convert money to float. The route does not quantize amounts; `Decimal("71")` is `"71"` and `Decimal("73.500")` is `"73.500"`.
+- **Health payload.** `GET /health` returns `{ "status": "ok", "service": "prompt-to-provisioning-planner" }`.
+
+Still open:
+
 - **Validation issue codes.** A validation issue has `code`, `message`, and optional `field_path`. The `code` values for a JSON parse failure versus a schema failure are not specified.
-- **Decimal encoding.** Amounts are `Decimal` values and must display with two decimal places. Whether the API quantizes the `Decimal` or the client formats it is not specified.
 - **HCL ordering and escaping.** Output must be stable and user-influenced strings must be escaped. The sort key and the escape function are not specified.
-- **Health payload.** This architecture specifies `{ "status": "ok" }` only. The first implementation prompt also returned `service`. Remove that field so the handler matches this contract.

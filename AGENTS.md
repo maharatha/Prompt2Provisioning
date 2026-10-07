@@ -37,7 +37,7 @@ docker-compose.yml
 Dockerfile.api
 Dockerfile.ui
 app/
-  main.py              # FastAPI app, thin route handlers, CORS
+  main.py              # FastAPI app and thin route handlers
   models.py            # Pydantic models and enums
   store.py             # InMemoryStore
   planner.py           # mock LLM; returns str only
@@ -97,7 +97,7 @@ The mock planner (and any future LLM) is an **untrusted proposal generator**.
 - Unknown resource types, SKUs, regions, or required values **fail closed**.
 - Deterministic code owns schema validation, policies, pricing, approval, hashing, and artifact generation.
 
-Malformed generator output is a first-class demo path: persist as `draft` with `validation_errors`, `approval_blocked=true`, and HTTP **201** (not 400).
+Malformed generator output is a first-class demo path: persist as `draft` with `validation_errors` and HTTP **201** (not 400). Approval of that draft returns **409**.
 
 ## Schema
 
@@ -199,7 +199,7 @@ Synthetic catalog:
 
 Happy-path cost: `2 * 18 + 35 = 71.00`. With 100 GB storage-standard: `73.50`.
 
-`approval_blocked` is derived: schema errors **or** any policy `error` **or** pricing failure. UI and API must key off this flag, not `status==evaluated` alone.
+Approval is blocked by schema errors, any policy `error`, or a pricing failure. The approve route enforces that through the service. `status == evaluated` alone does not mean approval will succeed. The plan response has no `approval_blocked` field.
 
 ## Canonical hashing
 
@@ -227,7 +227,7 @@ On approval and artifact generation, if `record.proposed` is missing, treat `cur
 | `evaluated` | Approve when every approval gate passes, or reject | Artifact |
 | `approved` | Artifact when the current hash still matches | Approve again, reject |
 | `rejected` | None | Approve, reject, artifact |
-| `artifact_generated` | Return the stored artifact when the hash still matches | Approve again, reject |
+| `artifact_generated` | Read the stored record, including `artifact` | Approve again, reject, generate again |
 
 Approval succeeds only when **all** of:
 
@@ -248,7 +248,7 @@ Invalid transitions return explicit business errors (HTTP **409** with a reason 
 
 Generate Terraform-style HCL **only** after successful approval. A `draft`, `evaluated`, or `rejected` plan cannot generate an artifact.
 
-Before generate (and before returning a previously stored artifact): recompute `canonical_hash(record.proposed)` and require it equals `record.plan_hash`. Status must be `approved` (or `artifact_generated` for idempotent replay **if** the hash still matches). Do not write that recomputed hash back.
+Before generate: recompute `canonical_hash(record.proposed)` and require it equals `record.plan_hash`. Status must be `approved`. A plan that is already `artifact_generated` is refused; read the stored HCL with `GET /v1/plans/{plan_id}`. Do not write that recomputed hash back.
 
 - Fictional `demo_*` resources only. Never `aws_*` or `azurerm_*`.
 - Prominent comment: this is a prototype; **nothing was deployed**.
@@ -258,25 +258,26 @@ Before generate (and before returning a previously stored artifact): recompute `
 
 ## API contracts
 
-Base path `/v1`. JSON only. No authentication.
+Base path `/v1`. JSON only. No authentication. Run one API worker. Handlers call the service synchronously and do not await during a transition. The in-memory store is not locked.
 
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/v1/plans` | `{ "prompt": str }` → mock generate, validate, evaluate if possible, persist. **201** including drafts with validation errors. |
-| `GET` | `/v1/plans/{id}` | **200** or **404** |
-| `POST` | `/v1/plans/{id}/approve` | `{ "plan_hash": str }` — gates above. **409** on failure. |
-| `POST` | `/v1/plans/{id}/reject` | No body. The plan id is the only input. `draft` or `evaluated` → `rejected`, preserving the proposal, hash, and evaluation results. **409** for `approved`, `rejected`, or `artifact_generated`. |
-| `POST` | `/v1/plans/{id}/artifact` | No body. Approved + current hash match → `{ "format": "terraform", "content": str, "filename": "main.tf" }`. Refused for `rejected`. |
-| `GET` | `/health` | `{ "status": "ok" }` |
+| `POST` | `/v1/plans` | `{ "prompt": str }` → mock generate, validate, evaluate if possible, persist. **201** `PlanRecord`, including drafts with validation errors. Unknown `SCENARIO:` names are **422** `{ "code": "unknown_scenario", "message" }` and are not stored. |
+| `GET` | `/v1/plans/{plan_id}` | **200** `PlanRecord`, or **404** `{ "code": "not_found", "message" }`. |
+| `POST` | `/v1/plans/{plan_id}/approve` | `{ "plan_hash": str }`. **200** updated `PlanRecord`. **409** `{ "code", "message" }` names the failed gate. The service checks hash format. |
+| `POST` | `/v1/plans/{plan_id}/reject` | No body. The plan id is the only input. `draft` or `evaluated` → `rejected`, preserving the proposal, hash, and evaluation results. **200** updated `PlanRecord`. **409** for `approved`, `rejected`, or `artifact_generated`. |
+| `POST` | `/v1/plans/{plan_id}/artifact` | No body. Approved plan whose current hash still matches → updated `PlanRecord` with the HCL in `artifact`. **409** when refused, including a rejected plan or a repeated generation. |
+| `GET` | `/v1/schema/plan` | `ProposedPlan.model_json_schema()`. |
+| `GET` | `/health` | `{ "status": "ok", "service": "prompt-to-provisioning-planner" }`. |
 
-Public record fields: `id`, `prompt`, `raw_output`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `approval_blocked`, `artifact_available`. Include `raw_output` so the UI can show untrusted JSON.
+Plan routes return `PlanRecord`: `id`, `prompt`, `raw_output`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `artifact`, `created_at`, `updated_at`. Include `raw_output` so the UI can show untrusted JSON. `artifact` is null until generation. Currency amounts are JSON strings from Pydantic, not floats. Request-body and UUID failures use FastAPI's **422** `detail` body. Service errors contain only `code` and `message`, with no stack trace.
 
 ## Streamlit
 
 - Prompt text area, submit, display raw JSON, validated plan, policy table, synthetic cost.
 - Approve sends the **stored** `plan_hash` from the last GET/POST response. Reject sends the plan id only.
-- Disable approve when `approval_blocked`.
-- Generate artifact and download `main.tf` only after approval.
+- Disable approve when the record has validation errors, a policy `error`, or pricing that did not succeed.
+- Generate artifact and download `main.tf` only after approval. The file body is the plan record's `artifact` field.
 - Configure API base URL via environment (Compose: `API_URL=http://api:8000`).
 
 ## Testing

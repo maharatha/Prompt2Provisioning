@@ -71,7 +71,7 @@ Scenarios
 Pass ``scenario`` or include ``SCENARIO:<name>`` in the prompt. Either form
 skips vocabulary parsing and returns a fixed string. The string is not parsed
 and not repaired. An explicit ``scenario`` argument wins when both are present.
-Names are case-sensitive. An unknown name raises ``ValueError``.
+Names are case-sensitive. An unknown name raises ``UnknownScenarioError``.
 
 - ``malformed_json`` (prompt alias ``malformed``): truncated JSON
 - ``missing_region``: JSON object with the region key omitted
@@ -155,6 +155,14 @@ _SCENARIO_RE = re.compile(r"SCENARIO:([A-Za-z0-9_]+)")
 _MALFORMED_JSON = '{ "region": "us-east-1", "resources": [\n'
 
 
+class UnknownScenarioError(ValueError):
+    """The selected scenario name is not one of the fixed planner fixtures."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__(f"unknown planner scenario: {name}")
+
+
 class Planner(Protocol):
     def generate(self, prompt: str) -> str:
         """Return one raw plan string for a prompt."""
@@ -180,7 +188,7 @@ def _scenario_name(prompt: str) -> str | None:
 def _scenario_output(name: str) -> str:
     canonical = _SCENARIO_ALIASES.get(name)
     if canonical is None:
-        raise ValueError(f"unknown planner scenario: {name}")
+        raise UnknownScenarioError(name)
     if canonical == "malformed_json":
         return _MALFORMED_JSON
     return _dumps(_SCENARIO_PLANS[canonical])
