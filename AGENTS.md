@@ -211,17 +211,23 @@ Happy-path cost: `2 * 18 + 35 = 71.00`. With 100 GB storage-standard: `73.50`.
 
 Set `record.plan_hash = canonical_hash(proposed)` **once** at evaluation. Never overwrite it on approve, reject, or artifact generation.
 
-Recomputing a hash is a **freshness check**, not a chance to bless a mutated plan.
+Recomputing a hash is a **freshness check** for approval and artifact generation, not a chance to bless a mutated plan. Rejection does not compute a hash.
 
 Use `hmac.compare_digest` for all hash equality checks.
 
-If `record.proposed` is missing, treat `current_hash` as a mismatch.
+On approval and artifact generation, if `record.proposed` is missing, treat `current_hash` as a mismatch.
 
 ## Approval, rejection, and state
 
-Statuses: `draft` → `evaluated` → `approved` | `rejected`. `approved` → `artifact_generated`. `rejected` is terminal for that record (new prompt → new `POST /v1/plans`). No reject-after-approve. No approve from `draft`.
+`draft` may become `evaluated` or `rejected`. `evaluated` may become `approved` or `rejected`. `approved` may become `artifact_generated`. `rejected` is terminal for that record (new prompt → new `POST /v1/plans`).
 
-On **every** approve and reject, compute `current_hash = canonical_hash(record.proposed)` and **do not write it back**.
+| From | Allowed | Refused |
+|---|---|---|
+| `draft` | Reject | Approve, artifact |
+| `evaluated` | Approve when every approval gate passes, or reject | Artifact |
+| `approved` | Artifact when the current hash still matches | Approve again, reject |
+| `rejected` | None | Approve, reject, artifact |
+| `artifact_generated` | Return the stored artifact when the hash still matches | Approve again, reject |
 
 Approval succeeds only when **all** of:
 
@@ -232,17 +238,17 @@ Approval succeeds only when **all** of:
 5. no policy result has `status=error`
 6. pricing succeeded (`cost` present, no pricing error, monthly total present)
 
-Comparing only the client hash to the stored hash is **insufficient**. A mutated `proposed` with a stale stored hash must fail because `current_hash != record.plan_hash`.
+On approval, compute `current_hash = canonical_hash(record.proposed)` and **do not write it back**. Comparing only the client hash to the stored hash is **insufficient**. A mutated `proposed` with a stale stored hash must fail because `current_hash != record.plan_hash`.
 
-Reject uses the same three-way hash check and requires `evaluated`.
+Rejection requires the plan id only. It does not accept a submitted hash, compare hashes, or recompute `canonical_hash`. `draft` and `evaluated` may become `rejected`. Rejection preserves the proposal, `plan_hash`, validation errors, policy checks, and cost. It does not apply the approval gates. `approved`, `rejected`, and `artifact_generated` cannot be rejected. A rejected plan cannot be approved.
 
 Invalid transitions return explicit business errors (HTTP **409** with a reason that names the failed gate). Missing records: **404**. Do not leak exception stack traces through the API.
 
 ## Artifacts
 
-Generate Terraform-style HCL **only** after successful approval.
+Generate Terraform-style HCL **only** after successful approval. A `draft`, `evaluated`, or `rejected` plan cannot generate an artifact.
 
-Before generate (and before returning a previously stored artifact): recompute `canonical_hash(record.proposed)` and require it equals `record.plan_hash`. Status must be `approved` (or `artifact_generated` for idempotent replay **if** the hash still matches).
+Before generate (and before returning a previously stored artifact): recompute `canonical_hash(record.proposed)` and require it equals `record.plan_hash`. Status must be `approved` (or `artifact_generated` for idempotent replay **if** the hash still matches). Do not write that recomputed hash back.
 
 - Fictional `demo_*` resources only. Never `aws_*` or `azurerm_*`.
 - Prominent comment: this is a prototype; **nothing was deployed**.
@@ -259,8 +265,8 @@ Base path `/v1`. JSON only. No authentication.
 | `POST` | `/v1/plans` | `{ "prompt": str }` → mock generate, validate, evaluate if possible, persist. **201** including drafts with validation errors. |
 | `GET` | `/v1/plans/{id}` | **200** or **404** |
 | `POST` | `/v1/plans/{id}/approve` | `{ "plan_hash": str }` — gates above. **409** on failure. |
-| `POST` | `/v1/plans/{id}/reject` | `{ "plan_hash": str }` — three-way hash; `evaluated` only. |
-| `POST` | `/v1/plans/{id}/artifact` | No body. Approved + current hash match → `{ "format": "terraform", "content": str, "filename": "main.tf" }`. |
+| `POST` | `/v1/plans/{id}/reject` | No body. The plan id is the only input. `draft` or `evaluated` → `rejected`, preserving the proposal, hash, and evaluation results. **409** for `approved`, `rejected`, or `artifact_generated`. |
+| `POST` | `/v1/plans/{id}/artifact` | No body. Approved + current hash match → `{ "format": "terraform", "content": str, "filename": "main.tf" }`. Refused for `rejected`. |
 | `GET` | `/health` | `{ "status": "ok" }` |
 
 Public record fields: `id`, `prompt`, `raw_output`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `approval_blocked`, `artifact_available`. Include `raw_output` so the UI can show untrusted JSON.
@@ -268,7 +274,7 @@ Public record fields: `id`, `prompt`, `raw_output`, `status`, `proposed`, `plan_
 ## Streamlit
 
 - Prompt text area, submit, display raw JSON, validated plan, policy table, synthetic cost.
-- Approve / Reject send the **stored** `plan_hash` from the last GET/POST response.
+- Approve sends the **stored** `plan_hash` from the last GET/POST response. Reject sends the plan id only.
 - Disable approve when `approval_blocked`.
 - Generate artifact and download `main.tf` only after approval.
 - Configure API base URL via environment (Compose: `API_URL=http://api:8000`).

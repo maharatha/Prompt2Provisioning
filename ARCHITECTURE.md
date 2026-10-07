@@ -20,7 +20,7 @@ Implementation then proceeds by prompting against this document, one slice at a 
 - Propose plan JSON from a deterministic mock planner with a small vocabulary, plus fixed `SCENARIO:` payloads for invalid and edge cases.
 - Parse that JSON and validate it against a strict schema. Invalid generator output is stored and returned; it is not rejected at the HTTP layer and it is not repaired.
 - Evaluate a fixed set of policies and a local synthetic price catalog.
-- Let a reviewer approve or reject the evaluated plan. Approval is bound to a canonical hash of the proposal.
+- Let a reviewer approve an evaluated plan or reject a draft or evaluated plan. Approval is bound to a canonical hash of the proposal. Rejection uses the plan id only and keeps the stored proposal, hash, and evaluation results.
 - After approval, render a deterministic dry-run HCL document.
 - Expose the lifecycle over HTTP and a Streamlit client that calls only that HTTP API.
 - Run the API and UI together with Docker Compose, and locally without Docker.
@@ -79,7 +79,7 @@ Flat layout under `app/`, `ui/`, and `tests/`. No `src/` tree, no domain/infrast
 | `services.py` | Own state transitions. | Call a cloud SDK or Terraform. |
 | `artifacts.py` | Render HCL after approval and a fresh hash check. | Render when status is not approved or the hash drifted. |
 | `store.py` | Get and put records. | Apply policy or pricing. |
-| `ui/app.py` | Present the plan and send the stored hash. | Import `app.services`, `app.store`, `app.policies`, or any other domain module. |
+| `ui/app.py` | Present the plan, send the stored hash on approve, and reject with the plan id only. | Import `app.services`, `app.store`, `app.policies`, or any other domain module. |
 
 `Planner` is an optional five-line protocol: `generate(prompt: str) -> str`. The only implementation is `MockPlanner`.
 
@@ -105,8 +105,8 @@ Flat layout under `app/`, `ui/`, and `tests/`. No `src/` tree, no domain/infrast
 4. If the schema fails, the record stays `draft`, `proposed` is null, and policy, pricing, and hashing do not run.
 5. If the schema passes, policies and pricing run, then `plan_hash` is set once. Status becomes `evaluated` even when a policy or the price check fails.
 6. The UI shows the raw JSON, the validated plan, the policy table, and the synthetic cost.
-7. Approve and reject submit the `plan_hash` from that response.
-8. Artifact generation runs only after approval and a second hash check. It stores the HCL and sets `artifact_generated`.
+7. Approve submits the `plan_hash` from that response. Reject submits the plan id only.
+8. Artifact generation runs only after approval and a second hash check. It stores the HCL and sets `artifact_generated`. A rejected plan cannot generate an artifact.
 
 Vocabulary covers postgres/database, container/web application, object storage, dev/test/prod, US East → `us-east-1`, US West → `us-west-2`, Azure East US → `eastus2`, small/medium/low cost, and quantities one/two/three.
 
@@ -114,15 +114,25 @@ If the prompt contains `SCENARIO:<name>`, vocabulary parsing is skipped and a fi
 
 ## States
 
-`draft` → `evaluated` → `approved` or `rejected`. `approved` → `artifact_generated`. `rejected` is terminal. A new request is a new `POST /v1/plans`.
+`draft` may become `evaluated` or `rejected`. `evaluated` may become `approved` or `rejected`. `approved` may become `artifact_generated`. `rejected` is terminal. A new request is a new `POST /v1/plans`.
 
-| From | Transition | Refused |
+```mermaid
+stateDiagram-v2
+  [*] --> draft
+  draft --> evaluated
+  draft --> rejected
+  evaluated --> approved
+  evaluated --> rejected
+  approved --> artifact_generated
+```
+
+| From | Allowed | Refused |
 |---|---|---|
-| `draft` | None on this record | Approve, reject, artifact |
-| `evaluated` | Approve or reject when the hash gates pass | Artifact |
-| `approved` | Artifact when the current hash still matches | Reject |
-| `rejected` | None | Artifact |
-| `artifact_generated` | Return the stored artifact when the hash still matches | Reject, approve again |
+| `draft` | Reject | Approve, artifact |
+| `evaluated` | Approve when every approval gate passes, or reject | Artifact |
+| `approved` | Artifact when the current hash still matches | Approve again, reject |
+| `rejected` | None | Approve, reject, artifact |
+| `artifact_generated` | Return the stored artifact when the hash still matches | Approve again, reject |
 
 A policy error or a pricing failure does not push the record back to `draft`. The record stays `evaluated` and `approval_blocked` is true. A warning does not block. Clients must use `approval_blocked`. `status == evaluated` is not sufficient to enable approval.
 
@@ -138,9 +148,9 @@ Serialization uses the proposal only:
 2. `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)` sorts dictionary keys and leaves resource list order unchanged. The plan is not otherwise reordered or normalized. Unicode is encoded as UTF-8, not as `\u` escapes.
 3. `canonical_hash` is the lowercase SHA-256 hexadecimal digest of those UTF-8 bytes.
 
-Evaluation writes `plan_hash` once. Approve, reject, and artifact generation recompute `current_hash` and do not store it. Writing the recomputed value back would accept a plan that changed after evaluation.
+Evaluation writes `plan_hash` once. Approval and artifact generation recompute `current_hash` and do not store it. Writing the recomputed value back would accept a plan that changed after evaluation. Rejection does not recompute a hash and does not replace the stored one.
 
-Both comparisons use `hmac.compare_digest`. If `proposed` is missing, the current hash is treated as a mismatch.
+Both approval comparisons use `hmac.compare_digest`. On approval and artifact generation, if `proposed` is missing, the current hash is treated as a mismatch.
 
 Approval succeeds only when all of the following are true:
 
@@ -153,7 +163,9 @@ Approval succeeds only when all of the following are true:
 
 The submitted hash ties the reviewer to the evaluation they were shown. The recomputed hash detects a `proposed` value changed in the store afterward. Submitting the old hash after that change returns **409**.
 
-Reject uses the same three-way check and requires `evaluated`. Artifact generation requires `approved`, or `artifact_generated` when returning an already rendered file, and requires `current_hash == plan_hash`. Hash drift after approval returns **409** and does not render.
+Rejection requires the plan id and no submitted hash. `draft` and `evaluated` may become `rejected`. The proposal, hash, and evaluation results stay as stored. Rejection does not apply the approval gates. `approved`, `rejected`, and `artifact_generated` cannot be rejected. A rejected plan cannot be approved.
+
+Artifact generation requires `approved`, or `artifact_generated` when returning an already rendered file, and requires `current_hash == plan_hash`. Hash drift after approval returns **409** and does not render. A rejected plan cannot generate an artifact.
 
 Unknown ids are **404**. Illegal transitions are **409** and name the gate that failed. Error responses do not include stack traces.
 
@@ -201,13 +213,13 @@ Base path `/v1`. JSON. No authentication.
 | `POST` | `/v1/plans` | Create and evaluate. **201**, including drafts that failed validation. |
 | `GET` | `/v1/plans/{id}` | **200** or **404**. |
 | `POST` | `/v1/plans/{id}/approve` | Body `{ "plan_hash": str }`. **409** when any approval gate fails. |
-| `POST` | `/v1/plans/{id}/reject` | Body `{ "plan_hash": str }`. Same three-way hash check. `evaluated` only. |
-| `POST` | `/v1/plans/{id}/artifact` | No body. Returns `{ "format": "terraform", "content": str, "filename": "main.tf" }`. |
+| `POST` | `/v1/plans/{id}/reject` | No body. The plan id is the only input. `draft` or `evaluated` becomes `rejected` and keeps the proposal, hash, and evaluation results. **409** for `approved`, `rejected`, or `artifact_generated`. |
+| `POST` | `/v1/plans/{id}/artifact` | No body. Returns `{ "format": "terraform", "content": str, "filename": "main.tf" }`. Refused for a rejected plan. |
 | `GET` | `/health` | `{ "status": "ok" }`. |
 
 Public plan fields: `id`, `prompt`, `raw_output`, `status`, `proposed`, `plan_hash`, `validation_errors`, `policy_checks`, `cost`, `approval_blocked`, `artifact_available`. `raw_output` is the untrusted generator string. The HCL body is returned by the artifact route, not embedded in the plan payload.
 
-Streamlit disables approve while `approval_blocked` is true, sends the stored hash, and offers `main.tf` only after approval.
+Streamlit disables approve while `approval_blocked` is true, sends the stored hash on approve, rejects with the plan id only, and offers `main.tf` only after approval.
 
 Tests that must change a proposal after evaluation write the store directly. They do not go through an edit API.
 
@@ -230,7 +242,7 @@ Prompt one slice at a time, and include that slice’s tests in the same prompt:
 1. Domain models, in-memory store, and the health endpoint.
 2. Mock planner and `SCENARIO:` fixtures.
 3. Validation, the six policies, catalog pricing, and the canonical hash.
-4. Plan service and the `/v1` routes, including the three-way hash check.
+4. Plan service and the `/v1` routes, including the three-way hash check on approval. Rejection takes the plan id only.
 5. Jinja2 `main.tf.j2`, rendered only after the artifact hash check.
 6. Streamlit client.
 7. Docker Compose, Dockerfiles, and a README that matches this architecture.
