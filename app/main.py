@@ -7,6 +7,8 @@ prototype does not lock the in-memory store.
 """
 
 import json
+import logging
+import sys
 from pathlib import Path
 from typing import Literal
 from uuid import UUID
@@ -20,6 +22,25 @@ from app.models import PlanRecord, ProposedPlan
 from app.planner import UnknownScenarioError
 from app.services import PlanNotFound, PlanService, ServiceError
 from app.store import InMemoryStore
+
+_LOG = logging.getLogger("app")
+
+
+def configure_logging() -> None:
+    """Write plan events to the API process stderr.
+
+    The handler is attached once. Log lines name the plan and the outcome.
+    They do not include the request body, so an API key in that body is not logged.
+    """
+    _LOG.setLevel(logging.INFO)
+    if _LOG.handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _LOG.addHandler(handler)
+
+
+configure_logging()
 
 app = FastAPI(
     title="Prompt-to-Provisioning Planner",
@@ -78,8 +99,19 @@ def _error_content(code: str, message: str) -> dict[str, str]:
     return ApiError(code=code, message=message).model_dump()
 
 
+def _log_plan(event: str, record: PlanRecord) -> None:
+    _LOG.info(
+        "%s plan_id=%s status=%s generator=%s",
+        event,
+        record.id,
+        record.status.value,
+        record.generator,
+    )
+
+
 @app.exception_handler(ServiceError)
-async def handle_service_error(_request: Request, exc: ServiceError) -> JSONResponse:
+async def handle_service_error(request: Request, exc: ServiceError) -> JSONResponse:
+    _LOG.warning("%s %s refused code=%s", request.method, request.url.path, exc.code)
     return JSONResponse(
         status_code=exc.http_status,
         content=_error_content(exc.code, exc.message),
@@ -87,7 +119,8 @@ async def handle_service_error(_request: Request, exc: ServiceError) -> JSONResp
 
 
 @app.exception_handler(ProviderError)
-async def handle_provider_error(_request: Request, exc: ProviderError) -> JSONResponse:
+async def handle_provider_error(request: Request, exc: ProviderError) -> JSONResponse:
+    _LOG.warning("%s %s provider_error", request.method, request.url.path)
     return JSONResponse(
         status_code=422,
         content=_error_content("provider_error", f"provider_error: {exc.message}"),
@@ -96,9 +129,10 @@ async def handle_provider_error(_request: Request, exc: ProviderError) -> JSONRe
 
 @app.exception_handler(UnknownScenarioError)
 async def handle_unknown_scenario(
-    _request: Request,
+    request: Request,
     exc: UnknownScenarioError,
 ) -> JSONResponse:
+    _LOG.warning("%s %s unknown_scenario", request.method, request.url.path)
     # Only this planner failure is a client input error. Other ValueErrors
     # stay unhandled so they are not reported as bad prompts.
     return JSONResponse(
@@ -130,13 +164,16 @@ async def create_plan(
     Invalid planner JSON is persisted as a draft and returned with 201.
     """
     if body.provider == "mock":
-        return service.create_plan(body.prompt)
-    raw_output = complete_plan(body.provider, body.model, body.api_key, body.prompt)
-    return service.create_plan(
-        body.prompt,
-        raw_output=raw_output,
-        generator=f"{body.provider}:{body.model}",
-    )
+        record = service.create_plan(body.prompt)
+    else:
+        raw_output = complete_plan(body.provider, body.model, body.api_key, body.prompt)
+        record = service.create_plan(
+            body.prompt,
+            raw_output=raw_output,
+            generator=f"{body.provider}:{body.model}",
+        )
+    _log_plan("created", record)
+    return record
 
 
 @app.get(
@@ -164,7 +201,9 @@ async def approve_plan(
     body: ApprovePlanRequest,
     service: PlanService = Depends(get_plan_service),
 ) -> PlanRecord:
-    return service.approve_plan(plan_id, body.plan_hash)
+    record = service.approve_plan(plan_id, body.plan_hash)
+    _log_plan("approved", record)
+    return record
 
 
 @app.post(
@@ -176,7 +215,9 @@ async def reject_plan(
     plan_id: UUID,
     service: PlanService = Depends(get_plan_service),
 ) -> PlanRecord:
-    return service.reject_plan(plan_id)
+    record = service.reject_plan(plan_id)
+    _log_plan("rejected", record)
+    return record
 
 
 @app.post(
@@ -188,7 +229,9 @@ async def generate_artifact(
     plan_id: UUID,
     service: PlanService = Depends(get_plan_service),
 ) -> PlanRecord:
-    return service.generate_artifact(plan_id)
+    record = service.generate_artifact(plan_id)
+    _log_plan("artifact", record)
+    return record
 
 
 @app.get("/v1/decisions", response_model=list[PlanRecord])

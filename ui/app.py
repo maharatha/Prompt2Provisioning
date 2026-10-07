@@ -1333,7 +1333,7 @@ deploy anything.
 
 ### Architecture
 
-One FastAPI process owns the rules. One Streamlit process is the client. Plan state is a dictionary in the API process. Restarting the API drops every plan.
+One FastAPI process owns the rules. One Streamlit process is the client. Plan state is a dictionary in the API process. Restarting the API drops every plan. The API writes a log line to its own stderr for each create, approval, rejection, artifact, and refusal. That line names the plan and the outcome. It does not include the request body or an API key.
 
 | Piece | Role |
 |---|---|

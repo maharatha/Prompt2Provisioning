@@ -8,6 +8,7 @@ A local prototype that turns a plain-language infrastructure request into a revi
 |---|---|
 | **Runtime** | Python 3.12, FastAPI, Streamlit |
 | **Persistence** | In-memory, one API process. A restart clears every plan. |
+| **Logs** | API process stderr. Each line names the plan id, status, and outcome. The request body, including any API key, is not logged. |
 | **Default planner** | Deterministic vocabulary matcher. Optional OpenAI or Anthropic call, key sent with that request only. |
 | **Review gate** | Schema, policy errors, and pricing must all pass, and the stored hash must still match the proposal. |
 | **Output** | Dry-run HCL using fictional `demo_*` resources. |
@@ -252,6 +253,7 @@ Business rules live in `app/services.py` and the modules it calls. Route handler
 | `services.py` | Create, evaluate, approve, reject, artifact, decision list | Cloud SDKs and the Terraform CLI |
 | `artifacts.py` | HCL after approval and a fresh hash check | Rendering any other status |
 | `store.py` | Get, create, and update records as deep copies | Policy and pricing |
+| `main.py` | HTTP routes and process logs for create, approve, reject, artifact, and refusals | Request bodies and API keys in log lines |
 | `ui/app.py` | Pages, the stored hash on approve, the plan id on reject | Domain imports |
 
 `Resource` and `ProposedPlan` are the generator contract. `PlanRecord` is the stored aggregate after the deterministic steps. A generated plan cannot supply status, cost, policy results, hashes, approval fields, or an artifact. Those fields exist only on the record.

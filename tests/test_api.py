@@ -1,3 +1,4 @@
+import logging
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -5,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.artifacts import render_artifact
+from app.llm import ProviderError
 from app.main import app, get_plan_service
 from app.models import PlanRecord, ProposedPlan
 from app.services import PlanService
@@ -652,6 +654,57 @@ def test_catalog_endpoints_return_the_json_files(api) -> None:
     assert prices.json()["postgres"]["db-large"] == "240"
     assert "us-east-1" in policy.json()["allowed_regions"]
     assert "db-large" in policy.json()["dev_allowed_skus"]["postgres"]
+
+
+def test_plan_actions_are_logged_without_the_api_key(api, caplog: pytest.LogCaptureFixture) -> None:
+    client, _store, _service = api
+    secret = "sk-demo-secret-do-not-log"
+    caplog.set_level(logging.INFO, logger="app")
+
+    created = _create(client, EXAMPLE_PROMPT)
+    plan_id = str(created["id"])
+    approved = client.post(
+        f"/v1/plans/{plan_id}/approve",
+        json={"plan_hash": created["plan_hash"]},
+    )
+    assert approved.status_code == 200
+    artifact = client.post(f"/v1/plans/{plan_id}/artifact")
+    assert artifact.status_code == 200
+    refused = client.post(f"/v1/plans/{plan_id}/reject")
+    assert refused.status_code == 409
+
+    text = caplog.text
+    assert f"created plan_id={plan_id} status=evaluated generator=mock" in text
+    assert f"approved plan_id={plan_id} status=approved generator=mock" in text
+    assert f"artifact plan_id={plan_id} status=artifact_generated generator=mock" in text
+    assert "refused code=status" in text
+    assert secret not in text
+    assert "api_key" not in text
+
+
+def test_provider_failure_log_omits_the_api_key(
+    api, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, _store, _service = api
+    secret = "sk-demo-secret-do-not-log"
+    caplog.set_level(logging.INFO, logger="app")
+
+    def fake(*_args: object, **_kwargs: object) -> str:
+        raise ProviderError(f"The model provider returned HTTP 401. {secret}")
+
+    monkeypatch.setattr("app.main.complete_plan", fake)
+    response = client.post(
+        "/v1/plans",
+        json={
+            "prompt": "one database",
+            "provider": "openai",
+            "model": "gpt-5",
+            "api_key": secret,
+        },
+    )
+    assert response.status_code == 422
+    assert "provider_error" in caplog.text
+    assert secret not in caplog.text
 
 
 def test_schema_endpoint_matches_proposed_plan_schema(api) -> None:
