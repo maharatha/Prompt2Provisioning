@@ -1,0 +1,25 @@
+# Prototype dry-run artifact.
+# Resources are fictional.
+# Nothing was deployed.
+
+locals {
+  region = {{ region }}
+  environment = {{ environment }}
+  tags = {
+{% for key, value in tags %}
+    {{ key }} = {{ value }}
+{% endfor %}
+  }
+}
+{% for resource in resources %}
+
+resource "{{ resource.resource_type }}" "{{ resource.label }}" {
+  count = {{ resource.count }}
+  name = {{ resource.name }}
+  sku = {{ resource.sku }}
+  public_access = {{ resource.public_access }}
+{% if resource.include_capacity %}
+  capacity_gb = {{ resource.capacity_gb }}
+{% endif %}
+}
+{% endfor %}
